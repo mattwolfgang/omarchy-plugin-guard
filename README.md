@@ -24,7 +24,7 @@ Installs and updates use exactly the commit that was scanned:
 
 Omarchy has no supported way to put a check in front of `omarchy plugin add` and `omarchy plugin update`, so Plugin Guard covers them in two ways:
 
-- **Typed commands are checked before installing.** With your consent, `install.sh` adds one line to `~/.bashrc` that sources `shell/omarchy-plugin-guard.bash`. In a terminal, `omarchy plugin add|install <url>` and `omarchy plugin update [id]` then run through `plugin-guard`, which scans first and asks. `--yes` still refuses a plugin or update rated dangerous; add `--force` to override. Every other `omarchy` command runs unchanged. Bypass it for one command with `PLUGIN_GUARD_BYPASS=1 omarchy plugin add …`.
+- **Typed commands are checked before installing.** With your consent, `install.sh` adds one line to `~/.bashrc` that sources `shell/omarchy-plugin-guard.bash`. In a terminal, `omarchy plugin add|install <url>` and `omarchy plugin update [id]` then run through `plugin-guard`, which scans first. It asks before installing a plugin, and before applying an update rated caution or dangerous. An update rated safe is applied without asking, with a one-line note pointing to its report; set `"confirmSafeUpdates": true` to be asked about those too. Updating every plugin at once (no id) first warns that each update found gets its own model review, which can use a lot of tokens on a frontier model, and asks whether to continue. `--yes` still refuses a plugin or update rated dangerous; add `--force` to override. Every other `omarchy` command runs unchanged. Bypass it for one command with `PLUGIN_GUARD_BYPASS=1 omarchy plugin add …`.
 - **Everything else is checked right after.** The Plugin Manager, its background auto-updates, and scripts call `omarchy` directly, so they skip the terminal function. For those, the widget runs `plugin-guard sweep` (unless Auto-scan is off) whenever the shell reloads its plugins (which any install or update causes) and every ten minutes. The sweep finds plugins that are new or changed since Plugin Guard last saw them and runs the static checks, which take about a second. A plugin they rate dangerous is disabled at once. The model review follows, disables the plugin if it rates it dangerous, and you get a notification with the result. The first sweep only records what is already installed. Scan those plugins from the widget.
 
 A pre-install hook in Omarchy itself would cover every path before anything is installed. `docs/upstream-hook.md` describes the change.
@@ -117,11 +117,12 @@ Settings live in `~/.config/plugin-guard/config.json`:
   "localEndpoints": ["http://127.0.0.1:8080"],
   "maxInputTokens": { "local": 100000, "claude": 150000, "codex": 150000, "grok": 150000 },
   "timeoutSeconds": 1800,
-  "gateTimeoutSeconds": 100
+  "gateTimeoutSeconds": 100,
+  "confirmSafeUpdates": false
 }
 ```
 
-`gateTimeoutSeconds` caps the model review when the pre-install hook runs with nobody at a terminal.
+`gateTimeoutSeconds` caps the model review when the pre-install hook runs with nobody at a terminal. `confirmSafeUpdates` asks before applying an update rated safe in a terminal; installs and updates rated caution or dangerous are always asked about.
 
 Reports are kept in `~/.local/state/plugin-guard/reports/`. Scanned clones that were not installed are deleted after seven days.
 

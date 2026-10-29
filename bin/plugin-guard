@@ -80,6 +80,9 @@ DEFAULT_CONFIG = {
   # Model review cap for the pre-install hook when nobody is at a terminal,
   # inside the caller's own timeout (the Plugin Manager plugin allows 180 s).
   "gateTimeoutSeconds": 100,
+  # Ask before applying an update rated safe. Caution and dangerous updates,
+  # and new installs, are always asked about.
+  "confirmSafeUpdates": False,
 }
 
 # Scan limits. Files beyond them are reported as not reviewed.
@@ -1722,13 +1725,19 @@ def update_one(args, config, model, plugin_id):
     if result.get("upToDate"):
       print(f"{plugin_id} is up to date", file=sys.stderr)
       return result
-    print_report(result["report"], verbose=args.verbose)
-    if confirm_report(result["report"], f"Apply this update to {plugin_id}?"):
-      apply_update(result["report"]["scanId"], force=args.force, out=out)
+    report = result["report"]
+    if report["verdict"] == "safe" and not config.get("confirmSafeUpdates"):
+      apply_update(report["scanId"], out=out)
+      result["applied"] = True
+      print(f"Updated {term_safe(plugin_id)}: rated safe. Report: plugin-guard report {report['scanId']}", file=sys.stderr)
+      return result
+    print_report(report, verbose=args.verbose)
+    if confirm_report(report, f"Apply this update to {plugin_id}?"):
+      apply_update(report["scanId"], force=args.force, out=out)
       result["applied"] = True
       print(f"Updated {plugin_id}", file=sys.stderr)
     else:
-      print(f"Update not applied. Apply it later with: plugin-guard apply-update {result['report']['scanId']}",
+      print(f"Update not applied. Apply it later with: plugin-guard apply-update {report['scanId']}",
             file=sys.stderr)
     return result
   apply = args.yes and not args.check_only
@@ -1742,15 +1751,32 @@ def update_one(args, config, model, plugin_id):
   return result
 
 
+def update_cost_warning(model, config, count):
+  """Every update found gets its own model review, so checking all plugins at
+  once can add up: usage on a frontier plan, or time on a local model."""
+  label = term_safe(model["label"])
+  if model["kind"] == "local":
+    return (f"Checking {count} plugins for updates. Each update found is reviewed by {label}, "
+            "which can take several minutes per plugin.")
+  budget = config["maxInputTokens"].get(model["kind"], 0)
+  return (f"Checking {count} plugins for updates. Each update found is sent to {label} for review, "
+          f"about {budget:,} input tokens at most for a typical plugin and more for large ones, "
+          "so several updates can use a lot of your plan's usage.")
+
+
 def cmd_update(args, config):
   model = None if args.no_model else resolve_model(config, args.model)
   if args.plugin_id:
     return finish(args, args.out, update_one(args, config, model, args.plugin_id), "result")
   # Like `omarchy plugin update` with no id: every plugin that is a git checkout.
+  plugins = [p for p in third_party_plugins() if (PLUGINS_DIR / p["id"] / ".git").is_dir()]
+  if model and len(plugins) > 1 and human(args) and not args.check_only:
+    print(update_cost_warning(model, config, len(plugins)), file=sys.stderr)
+    if not args.yes and not ask("Continue?", default_yes=True):
+      print("No updates checked.", file=sys.stderr)
+      return 0
   results, failed = [], 0
-  for p in third_party_plugins():
-    if not (PLUGINS_DIR / p["id"] / ".git").is_dir():
-      continue
+  for p in plugins:
     try:
       results.append(update_one(args, config, model, p["id"]))
     except GuardError as e:
