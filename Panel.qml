@@ -56,6 +56,9 @@ Panel {
   property string notice: ""
   // install.sh has not run and the reminder was not dismissed.
   property bool setupNeeded: false
+  // A newer Plugin Guard upstream. It cannot scan itself, so it shows the
+  // commits it would apply and updates from its own repository.
+  property var selfUpdate: ({})
   property double now: Date.now()
 
   // A unit's heartbeat lands every 5 s; one silent for 30 s has died.
@@ -92,6 +95,17 @@ Panel {
     root.controller.show()
     refreshStatus()
     refreshModels()
+    checkSelfUpdate()
+  }
+
+  // Fetches from GitHub at most every six hours; the result is cached.
+  function checkSelfUpdate() {
+    if (!selfCheckProc.running) selfCheckProc.running = true
+  }
+
+  function applySelfUpdate() {
+    if (!selfUpdate.available) return
+    runJob("self-update", "Plugin Guard", ["self-update", "--yes", "--to", String(selfUpdate.incoming)])
   }
 
   function close() {
@@ -276,6 +290,9 @@ Panel {
       notice = strings.t("done.updated").arg(target)
       view = "home"
       report = null
+    } else if (kind === "self-update") {
+      if (data.applied) notice = strings.t("self.updated").arg(data.version || "")
+      selfUpdate = ({})
     }
   }
 
@@ -352,6 +369,20 @@ Panel {
           var data = JSON.parse(String(text || ""))
           root.models = Array.isArray(data.models) ? data.models : []
           root.currentModel = String(data.current || "")
+        } catch (e) {}
+      }
+    }
+  }
+
+  Process {
+    id: selfCheckProc
+    command: ["python3", "-I", root.guardScript, "self-update", "--check", "--json", "--max-age", "21600"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var data = JSON.parse(String(text || ""))
+          root.selfUpdate = data && data.available === true ? data : ({})
         } catch (e) {}
       }
     }
@@ -545,6 +576,37 @@ Panel {
             width: parent.width
             spacing: Style.space(12)
             visible: root.view === "home"
+
+            Column {
+              width: parent.width
+              spacing: Style.space(8)
+              visible: root.selfUpdate.available === true
+
+              Caption { text: strings.t("self.heading").toUpperCase() }
+
+              Label {
+                width: parent.width
+                text: strings.t("self.available").arg(String(root.selfUpdate.version || "")).arg(String(root.selfUpdate.currentVersion || ""))
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Label {
+                width: parent.width
+                visible: text !== ""
+                text: (root.selfUpdate.commits || []).slice(0, 6).map(function(c) { return "· " + c }).join("\n")
+                  + ((root.selfUpdate.commits || []).length > 6 ? "\n…" : "")
+                color: root.dim
+                font.pixelSize: Style.font.caption
+              }
+
+              ActionButton {
+                text: strings.t("self.update")
+                enabled: !root.busy
+                onClicked: root.applySelfUpdate()
+              }
+
+              PanelSeparator { foreground: root.fg }
+            }
 
             Column {
               width: parent.width

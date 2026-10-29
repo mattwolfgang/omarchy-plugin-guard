@@ -31,6 +31,7 @@ for NDJSON progress on stdout):
   check <plugin-id>          scan an installed plugin in place
   status                     installed plugins and their latest scan results
   report <scan-id|plugin-id> show a saved report
+  self-update [--check]      update Plugin Guard itself from its repository
   setup-state done|dismiss   record that install.sh ran, or hide the reminder to run it
 """
 import argparse
@@ -52,7 +53,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -63,6 +64,7 @@ STAGES_DIR = STATE_DIR / "stages"
 INDEX_FILE = STATE_DIR / "installed.json"
 SEEN_FILE = STATE_DIR / "seen.json"
 SETUP_FILE = STATE_DIR / "setup.json"
+SELF_UPDATE_FILE = STATE_DIR / "self-update.json"
 LOCK_FILE = STATE_DIR / "lock"
 PLUGINS_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "plugins"
 
@@ -1204,6 +1206,89 @@ def install_scanned(scan_id, force=False, enable=False, section="", out=None):
   return {"ok": True, "pluginId": plugin_id, "enabled": enable, "path": str(target)}
 
 
+def check_self_update(out=None, max_age=0):
+  """Look for a newer Plugin Guard upstream. Plugin Guard cannot usefully scan
+  itself (its rules quote every pattern they look for), so it updates from
+  its own repository like Omarchy's updater does, showing the commits it
+  would apply. The result is cached so the widget does not fetch every time."""
+  out = out or Out()
+  cached = read_json(SELF_UPDATE_FILE, {})
+  checked = dt.datetime.fromisoformat(cached["checkedAt"]) if cached.get("checkedAt") else None
+  target = PLUGINS_DIR / SELF_ID
+  if not (target / ".git").is_dir():
+    return {"available": False, "reason": "Plugin Guard is not installed as a git checkout, so it cannot update itself"}
+  current = git(["rev-parse", "HEAD"], cwd=target)
+  if (max_age and checked and cached.get("current") == current
+      and (dt.datetime.now(dt.timezone.utc) - checked).total_seconds() < max_age):
+    return cached
+  out.progress("fetch", "Checking for a Plugin Guard update")
+  git(["fetch", "--quiet", "origin", "HEAD"], cwd=target, timeout=120)
+  incoming = git(["rev-parse", "FETCH_HEAD"], cwd=target)
+  installed = str(read_json(target / "manifest.json", {}).get("version") or current[:7])
+  info = {"available": False, "current": current, "incoming": incoming, "checkedAt": now_iso(),
+          "currentVersion": installed, "version": installed, "commits": []}
+  if incoming != current:
+    try:
+      git(["merge-base", "--is-ancestor", current, incoming], cwd=target)
+      fast_forward = True
+    except GuardError:
+      fast_forward = False
+    if not fast_forward:
+      info["reason"] = "the upstream version is not a fast-forward of the installed one; reinstall Plugin Guard"
+    else:
+      try:
+        info["version"] = str(json.loads(git(["show", f"{incoming}:manifest.json"], cwd=target)).get("version") or "")
+      except (GuardError, ValueError):
+        info["version"] = ""
+      info["commits"] = [clip(line, 200) for line in
+                         git(["log", "--format=%s", "--max-count=20", f"{current}..{incoming}"], cwd=target).splitlines()]
+      info["available"] = True
+  write_json(SELF_UPDATE_FILE, info)
+  return info
+
+
+def apply_self_update(info, out=None):
+  """Fast-forward Plugin Guard to the commit the check showed."""
+  out = out or Out()
+  target = PLUGINS_DIR / SELF_ID
+  if git(["rev-parse", "HEAD"], cwd=target) != info["current"]:
+    raise GuardError("Plugin Guard changed since the update check; check again")
+  out.progress("update", f"Updating Plugin Guard to {info.get('version') or info['incoming'][:7]}")
+  git(["merge", "--ff-only", "--quiet", info["incoming"]], cwd=target)
+  write_json(SELF_UPDATE_FILE, {})
+  subprocess.run(["omarchy-shell", "shell", "rescanPlugins"], capture_output=True)
+  return {"ok": True, "pluginId": SELF_ID, "applied": True, "version": info.get("version", ""), "commit": info["incoming"]}
+
+
+def update_self(args, out):
+  """`plugin-guard update` for Plugin Guard itself: list the commits, ask, apply."""
+  info = check_self_update(out)
+  result = {"ok": True, "pluginId": SELF_ID, "upToDate": not info["available"], "applied": False, "selfUpdate": info}
+  if info.get("reason"):
+    raise GuardError(info["reason"])
+  if not info["available"]:
+    if human(args):
+      print("Plugin Guard is up to date", file=sys.stderr)
+    return result
+  version = info["version"] or info["incoming"][:7]
+  if human(args):
+    print(f"Plugin Guard {term_safe(info['currentVersion'])} -> {term_safe(version)}:", file=sys.stderr)
+    for line in info["commits"]:
+      print(f"  - {term_safe(line, prose=True)}", file=sys.stderr)
+  if getattr(args, "check_only", False):
+    return result
+  expected = getattr(args, "to", "")
+  if expected and expected != info["incoming"]:
+    raise GuardError("Plugin Guard's repository changed since that update was shown; check again")
+  if args.yes or (human(args) and ask(f"Update Plugin Guard to {version}?", default_yes=True)):
+    result.update(apply_self_update(info, out))
+    if human(args):
+      print(f"Updated Plugin Guard to {term_safe(version)}", file=sys.stderr)
+  elif human(args):
+    print("Plugin Guard not updated", file=sys.stderr)
+  return result
+
+
 def update_plugin(plugin_id, model, config, out, apply=None, force=False, skip_model=False):
   target = PLUGINS_DIR / plugin_id
   if not re.match(r"^[A-Za-z0-9._-]+$", plugin_id) or not (target / ".git").is_dir():
@@ -1648,6 +1733,8 @@ def job_notify(args, out, data):
     notify(f"Installed {data['pluginId']}" + (" and enabled it" if data.get("enabled") else ""), "")
   elif out.job["kind"] == "apply" and data.get("pluginId"):
     notify(f"Updated {data['pluginId']}", "")
+  elif out.job["kind"] == "self-update" and data.get("applied"):
+    notify(f"Updated Plugin Guard to {data.get('version') or data['commit'][:7]}", "")
   elif isinstance(data, dict) and data.get("upToDate"):
     notify(f"{data.get('pluginId')} is up to date", "", "low")
   elif isinstance(report, dict) and report.get("verdict"):
@@ -1820,6 +1907,8 @@ def update_cost_warning(model, config, count):
 
 
 def cmd_update(args, config):
+  if args.plugin_id == SELF_ID:
+    return finish(args, args.out, update_self(args, args.out), "result")
   model = None if args.no_model else resolve_model(config, args.model)
   if args.plugin_id:
     return finish(args, args.out, update_one(args, config, model, args.plugin_id), "result")
@@ -1839,6 +1928,15 @@ def cmd_update(args, config):
       results.append({"ok": False, "pluginId": p["id"], "error": str(e)})
       if human(args):
         print(f"plugin-guard: {term_safe(p['id'])}: {term_safe(e, prose=True)}", file=sys.stderr)
+  # Plugin Guard itself is not in the list above; it updates last, so the
+  # other plugins are checked by the version that was running.
+  if human(args) and (PLUGINS_DIR / SELF_ID / ".git").is_dir():
+    try:
+      results.append(update_self(args, args.out))
+    except GuardError as e:
+      failed += 1
+      results.append({"ok": False, "pluginId": SELF_ID, "error": str(e)})
+      print(f"plugin-guard: {SELF_ID}: {term_safe(e, prose=True)}", file=sys.stderr)
   finish(args, args.out, {"ok": failed == 0, "results": results}, "result")
   return 1 if failed else 0
 
@@ -1869,6 +1967,23 @@ def cmd_status(args, config):
     label = {"unscanned": "not scanned", "changed": "changed since scan"}.get(r["state"], r["verdict"])
     print(f"{r['id']:52} {label}")
   return 0
+
+
+def cmd_self_update(args, config):
+  out = args.out
+  if args.check:
+    info = check_self_update(out, max_age=args.max_age)
+    if not args.json:
+      if info.get("reason"):
+        print(term_safe(info["reason"], prose=True), file=sys.stderr)
+      elif info["available"]:
+        print(f"Plugin Guard {term_safe(info['version'] or info['incoming'][:7])} is available "
+              f"(installed: {term_safe(info['currentVersion'])}). Update with: plugin-guard self-update", file=sys.stderr)
+      else:
+        print("Plugin Guard is up to date", file=sys.stderr)
+    return finish(args, out, info, "result")
+  args.check_only = False
+  return finish(args, out, update_self(args, out), "result")
 
 
 def cmd_setup_state(args, config):
@@ -1903,7 +2018,7 @@ class Cancelled(Exception):
   pass
 
 
-LOCKED_COMMANDS = {"scan", "add", "install", "update", "apply-update", "check", "sweep", "gate"}
+LOCKED_COMMANDS = {"scan", "add", "install", "update", "apply-update", "check", "sweep", "gate", "self-update"}
 
 
 def main(argv=None):
@@ -1996,6 +2111,15 @@ def main(argv=None):
   p.add_argument("--json", action="store_true")
   p.add_argument("-v", "--verbose", action="store_true")
   p.set_defaults(func=cmd_report)
+
+  p = sub.add_parser("self-update", help="update Plugin Guard itself from its repository")
+  p.add_argument("--check", action="store_true", help="only check for an update")
+  p.add_argument("--max-age", type=int, default=0, help=argparse.SUPPRESS)
+  p.add_argument("--to", default="", help="apply only if the update is this commit")
+  p.add_argument("-y", "--yes", action="store_true", help="update without asking")
+  p.add_argument("--json", action="store_true")
+  p.add_argument("--events", action="store_true", help=argparse.SUPPRESS)
+  p.set_defaults(func=cmd_self_update)
 
   p = sub.add_parser("setup-state", help="record that install.sh ran, or hide the reminder to run it")
   p.add_argument("action", choices=["done", "dismiss"])

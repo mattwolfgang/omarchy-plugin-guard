@@ -56,6 +56,7 @@ Click it to open the panel:
 
 - **Model picker.** Pick from every local and frontier model that is available.
 - **Check a plugin before installing.** Paste a git URL and press Scan. The report shows the verdict, a plain-language summary, whether the code matches its stated purpose, the findings with file and line, the network destinations, and the files that could not be reviewed. From the report, Install or Install and enable. A dangerous plugin needs a second click.
+- **Plugin Guard updates.** When a newer Plugin Guard is on GitHub, the panel shows its version and the commits it adds, with an **Update Plugin Guard** button. It checks when the panel opens, at most every six hours.
 - **Installed plugins.** Each plugin shows its latest result. Scan checks it in place. Update scans the incoming upstream update and offers Apply update.
 
 Scans of a mid-size plugin take seconds with a frontier model and a few minutes with a local 27B model. You get a notification when one finishes while the panel is closed. Middle-click the icon to refresh the status.
@@ -73,12 +74,15 @@ plugin-guard update <plugin-id>         # scan an update, ask, apply
 plugin-guard check <plugin-id>          # scan an installed plugin in place
 plugin-guard sweep                      # check plugins installed or changed outside Plugin Guard
 plugin-guard status                     # installed plugins and their results
+plugin-guard self-update                # update Plugin Guard itself (--check to only look)
 plugin-guard report <scan-id|plugin-id> # show a saved report
 ```
 
 Add `--model <id>` to any scan to override the current model, `--no-model` for static checks only, `-v` to include minor findings, and `--json` for machine-readable output.
 
 Use `plugin-guard add` in place of `omarchy plugin add`, and `plugin-guard update` in place of `omarchy plugin update`.
+
+Plugin Guard does not scan itself: its rules quote every pattern they look for, so it would flag its own code. It updates from its own repository instead, the way Omarchy's updater does. `plugin-guard self-update`, `plugin-guard update io.github.mattwolfgang.plugin-guard`, and updating every plugin at once all list the commits the update adds and ask before applying it. Self-update needs Plugin Guard installed as a git checkout, which `omarchy plugin add` and the marketplace do; a copy made by `./install.sh` from a checkout cannot update itself.
 
 ## Install
 
