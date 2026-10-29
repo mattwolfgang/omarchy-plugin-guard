@@ -125,6 +125,16 @@ Settings live in `~/.config/plugin-guard/config.json`:
 
 Reports are kept in `~/.local/state/plugin-guard/reports/`. Scanned clones that were not installed are deleted after seven days.
 
+## Remove
+
+```bash
+omarchy plugin remove io.github.mattwolfgang.plugin-guard
+rm -f ~/.local/bin/plugin-guard
+rm -f ~/.config/omarchy/hooks/plugin-pre-install.d/plugin-guard ~/.config/omarchy/hooks/plugin-pre-update.d/plugin-guard
+```
+
+Then delete the Plugin Guard line from `~/.bashrc` if `install.sh` added it. Settings are in `~/.config/plugin-guard/`, and reports and scan state in `~/.local/state/plugin-guard/`. Delete those folders to remove everything.
+
 ## Limits
 
 This is a screening tool, not a guarantee.
