@@ -82,6 +82,8 @@ Use `plugin-guard add` in place of `omarchy plugin add`, and `plugin-guard updat
 
 ## Install
 
+> **Plugins left disabled by versions before 1.0.3.** Installing a plugin with Plugin Guard and asking for it to be enabled could leave it installed but disabled, because the enable could reach the shell before the shell had picked up the new plugin. Version 1.0.3 waits for the shell first. If a plugin you installed this way is missing from the bar, enable it with `omarchy plugin enable <plugin-id>`; `omarchy plugin list` shows each plugin's id and whether it is enabled.
+
 From the Omarchy Plugin Marketplace, or:
 
 ```bash
