@@ -1097,6 +1097,29 @@ def omarchy(args, check=True, timeout=300):
   return r.stdout.strip()
 
 
+def wait_until_known(plugin_id, timeout=10):
+  """`omarchy plugin add` asks the shell to rescan but returns before the
+  rescan finishes, and an enable sent before then fails as an unknown plugin.
+  `omarchy plugin list` asks the running shell, so wait until it lists the id."""
+  deadline = time.monotonic() + timeout
+  while True:
+    try:
+      if any(p.get("id") == plugin_id for p in json.loads(omarchy(["plugin", "list", "--json"], timeout=30))):
+        return True
+    except (GuardError, OSError, ValueError, subprocess.TimeoutExpired):
+      pass
+    if time.monotonic() >= deadline:
+      return False
+    time.sleep(0.25)
+
+
+def enable_plugin(plugin_id, section=""):
+  if not wait_until_known(plugin_id):
+    raise GuardError(f"installed {plugin_id}, but the shell has not picked it up yet; "
+                     f"enable it with: omarchy plugin enable {plugin_id}")
+  omarchy(["plugin", "enable", plugin_id] + (["--section", section] if section else []))
+
+
 def fingerprint(root):
   """Cheap identity of a plugin folder's files (paths, sizes, mtimes), so a
   change is noticed even in a plugin that is not a git checkout."""
@@ -1177,8 +1200,7 @@ def install_scanned(scan_id, force=False, enable=False, section="", out=None):
 
   if enable:
     out.progress("enable", f"Enabling {plugin_id}")
-    args = ["plugin", "enable", plugin_id] + (["--section", section] if section else [])
-    omarchy(args)
+    enable_plugin(plugin_id, section)
   return {"ok": True, "pluginId": plugin_id, "enabled": enable, "path": str(target)}
 
 
@@ -1702,8 +1724,10 @@ def cmd_add(args, config):
     print(f"Installed {result['pluginId']}" + (" and enabled it" if result["enabled"] else ""), file=sys.stderr)
     if not result["enabled"] and not args.yes and ask(f"Enable {result['pluginId']} now?", report["verdict"] == "safe"):
       # Not captured, so omarchy can ask where to put a bar widget.
-      subprocess.run(["omarchy", "plugin", "enable", result["pluginId"]])
-      result["enabled"] = True
+      wait_until_known(result["pluginId"])
+      result["enabled"] = subprocess.run(["omarchy", "plugin", "enable", result["pluginId"]]).returncode == 0
+      if not result["enabled"]:
+        print(f"Not enabled. Enable it later with: omarchy plugin enable {result['pluginId']}", file=sys.stderr)
     elif not result["enabled"]:
       print(f"Enable it later with: omarchy plugin enable {result['pluginId']}", file=sys.stderr)
   return finish(args, out, result, "result")

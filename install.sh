@@ -84,12 +84,20 @@ for _ in 1 2 3 4 5; do
   sleep 1
 done
 
-enabled="$(omarchy plugin list --json | python3 -I -c '
+# The rescan finishes after rescanPlugins returns, and enabling a plugin the
+# shell does not know yet fails, so wait (up to 10 s) for it to be listed.
+state=unknown
+for _ in {1..40}; do
+  state="$(omarchy plugin list --json 2>/dev/null | python3 -I -c '
 import json, sys
-print(any(p.get("id") == sys.argv[1] and p.get("enabled") for p in json.load(sys.stdin)))
-' "$id")"
+p = next((p for p in json.load(sys.stdin) if p.get("id") == sys.argv[1]), None)
+print("unknown" if p is None else "enabled" if p.get("enabled") else "disabled")
+' "$id" 2>/dev/null)" || state=unknown
+  [[ $state == unknown ]] || break
+  sleep 0.25
+done
 
-if [[ $enabled != True ]]; then
+if [[ $state != enabled ]]; then
   omarchy plugin enable "$id" --section "$section"
 fi
 
