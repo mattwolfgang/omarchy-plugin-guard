@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mattwolfgang.plugin-guard",
   "name": "Plugin Guard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Matt Wolfgang",
   "license": "MIT",
   "description": "Security-check Omarchy plugins before installing or updating them, with static checks plus a review by a local model or the Claude, Codex, or Grok CLI",

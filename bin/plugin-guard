@@ -51,7 +51,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -155,7 +155,7 @@ class Out:
     if self.events:
       self.emit({"event": "progress", "stage": stage, "message": message})
     elif not self.job:
-      print(f"· {message}", file=sys.stderr, flush=True)
+      print(f"· {term_safe(message, prose=True)}", file=sys.stderr, flush=True)
 
   def done(self, key, data):
     if self.job:
@@ -178,7 +178,8 @@ class Out:
 
 def notify(title, body, urgency="normal"):
   if shutil.which("notify-send"):
-    subprocess.run(["notify-send", "-a", "Plugin Guard", "-u", urgency, title, body],
+    subprocess.run(["notify-send", "-a", "Plugin Guard", "-u", urgency,
+                    term_safe(title, prose=True), term_safe(body, prose=True)],
                    capture_output=True, timeout=10)
 
 
@@ -244,6 +245,73 @@ def save_config(config):
 def clip(value, limit):
   text = str(value if value is not None else "")
   return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# --------------------------------------------------------------------- terminal safety
+#
+# Most text Plugin Guard prints comes from the repository it is checking or
+# from a model reading it: names, summaries, findings, URLs, git and CLI
+# error output. A repository can put terminal control sequences in any of it
+# (OSC 52 rewrites the clipboard, others retitle the window or move the
+# cursor), and a newline in a plugin name could forge a line of the report.
+# So every untrusted field goes through term_safe() before it is formatted,
+# which shows control and invisible formatting characters as visible escapes.
+# As a second layer, stdout and stderr are wrapped so nothing written to them
+# can reach the terminal as a control character either. Plugin Guard's own
+# colors travel as private-use placeholders that term_safe() also escapes, so
+# untrusted text cannot produce them, and only the wrapper turns them into
+# color codes.
+
+# C0 and C1 controls, DEL, and invisible or direction-changing formatting
+# characters; the private-use block holds the color placeholders.
+UNSAFE_RE = re.compile("[\x00-\x1f\x7f-\x9f­؜ᅟᅠ᠎​-‏ -‮"
+                       "⁠-⁯ㅤ︀-️﻿￹-￻-]")
+WRITER_UNSAFE_RE = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f -‮⁦-⁩]")
+
+COLOR_CODES = {
+  "": "\033[0m", "": "\033[31m", "": "\033[33m",
+  "": "\033[32m", "": "\033[36m", "": "\033[90m",
+}
+
+
+def _visible(match):
+  code = ord(match.group(0))
+  return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
+
+
+def term_safe(value, prose=False):
+  """Untrusted text, safe to print. A line break becomes a space in prose
+  (summaries, details) and a visible \\n elsewhere (names, paths, URLs)."""
+  text = str(value if value is not None else "")
+  text = text.replace("\r\n", "\n")
+  text = re.sub(r"[\n\r\t]+", " ", text) if prose else text.replace("\t", " ")
+  return UNSAFE_RE.sub(_visible, text)
+
+
+class SafeWriter:
+  """Wraps stdout/stderr: escapes any control character that reaches it
+  (newlines pass) and turns color placeholders into codes, or drops them
+  when colors are off."""
+
+  def __init__(self, stream):
+    self.stream = stream
+    self.colors = stream.isatty() and not os.environ.get("NO_COLOR")
+
+  def write(self, text):
+    text = WRITER_UNSAFE_RE.sub(_visible, str(text))
+    for marker, code in COLOR_CODES.items():
+      text = text.replace(marker, code if self.colors else "")
+    return self.stream.write(text)
+
+  def __getattr__(self, name):
+    return getattr(self.stream, name)
+
+
+def safe_input(prompt):
+  """input() can write its prompt straight to the terminal, past the wrapper."""
+  sys.stderr.write(prompt)
+  sys.stderr.flush()
+  return sys.stdin.readline()
 
 
 # --------------------------------------------------------------------- models
@@ -1241,12 +1309,12 @@ def gate(kind, args, config, out):
     print_report(report)
   if report["verdict"] == "dangerous" and not os.environ.get("PLUGIN_GUARD_FORCE"):
     message = f"Plugin Guard refused the {what}: rated dangerous"
-    print(f"plugin-guard: {message}. Report: plugin-guard report {report['scanId']}", file=sys.stderr)
+    print(f"plugin-guard: {term_safe(message, prose=True)}. Report: plugin-guard report {term_safe(report['scanId'])}", file=sys.stderr)
     notify(message, clip(report["summary"] or report["findings"][0]["title"], 300), "critical")
     return 1
   if report["verdict"] == "caution" and interactive:
     if not confirm_report(report, f"Go ahead with the {what}?"):
-      print(f"plugin-guard: {what} not applied", file=sys.stderr)
+      print(f"plugin-guard: {term_safe(what)} not applied", file=sys.stderr)
       return 1
   elif report["verdict"] == "caution":
     notify(f"{plugin_id} needs a look", clip(report["summary"] or report["modelError"] or "Open Plugin Guard for the report.", 300))
@@ -1400,67 +1468,88 @@ def installed_status():
 
 # --------------------------------------------------------------------- human output
 
-COLORS = {"safe": "\033[32m", "caution": "\033[33m", "dangerous": "\033[31m"}
-SEV_COLORS = {"critical": "\033[31m", "high": "\033[31m", "medium": "\033[33m", "low": "\033[36m", "info": "\033[90m"}
+COLORS = {"safe": "", "caution": "", "dangerous": ""}
+SEV_COLORS = {"critical": "", "high": "", "medium": "", "low": "", "info": ""}
 
 
 def paint(text, color):
-  if not sys.stderr.isatty() or os.environ.get("NO_COLOR"):
-    return text
-  return f"{color}{text}\033[0m"
+  """Color already-safe text; the SafeWriter renders or drops the color."""
+  return f"{color}{text}"
 
 
-def print_report(report, file=sys.stderr, verbose=False):
-  p = report["plugin"]
+def print_report(report, file=None, verbose=False):
+  """Everything shown here is untrusted except the labels, so each field goes
+  through term_safe() (t for names and paths, prose for sentences). Verdicts
+  and severities are checked against the known values, since a saved report
+  is only a file."""
+  file = file or sys.stderr
+  t = term_safe
+
+  def prose(value):
+    return term_safe(value, prose=True)
+
+  def known(value, allowed, fallback):
+    return value if value in allowed else fallback
+
+  p = report.get("plugin") or {}
+  verdict = known(report.get("verdict"), VERDICTS, "caution")
   print(file=file)
-  print(f"{p['name'] or p['id']}  ({p['id']} {p['version']})", file=file)
-  src = report["source"]
-  print(f"Source: {src.get('url') or src.get('pluginId')}" + (f" @ {report['commit'][:12]}" if report.get("commit") else ""), file=file)
+  print(f"{t(p.get('name') or p.get('id'))}  ({t(p.get('id'))} {t(p.get('version'))})", file=file)
+  src = report.get("source") or {}
+  commit = f" @ {t(str(report['commit'])[:12])}" if report.get("commit") else ""
+  print(f"Source: {t(src.get('url') or src.get('path') or src.get('pluginId'))}{commit}", file=file)
   if report.get("model"):
-    print(f"Model:  {report['model']['label']}", file=file)
-  print(f"Verdict: {paint(report['verdict'].upper(), COLORS[report['verdict']])}"
-        f"   (static checks: {report['staticVerdict']}, model: {report['modelVerdict'] or 'not run'})", file=file)
+    print(f"Model:  {t(report['model'].get('label'))}", file=file)
+  print(f"Verdict: {paint(verdict.upper(), COLORS[verdict])}"
+        f"   (static checks: {known(report.get('staticVerdict'), VERDICTS, 'unknown')},"
+        f" model: {known(report.get('modelVerdict'), VERDICTS, 'not run')})", file=file)
   if report.get("modelError"):
-    print(paint(f"Model review failed: {report['modelError']}", "\033[33m"), file=file)
+    print(paint(f"Model review failed: {prose(report['modelError'])}", COLORS["caution"]), file=file)
   if report.get("summary"):
-    print(f"\n{report['summary']}", file=file)
+    print(f"\n{prose(report['summary'])}", file=file)
   if report.get("purposeMatch"):
-    print(f"\nPurpose: {report['purposeMatch']}", file=file)
-  minor = [f for f in report["findings"] if f["severity"] == "info" or (f["source"] == "static" and f["severity"] == "low")]
-  shown = [f for f in report["findings"] if verbose or f not in minor]
+    print(f"\nPurpose: {prose(report['purposeMatch'])}", file=file)
+  findings = [f for f in report.get("findings") or [] if isinstance(f, dict)]
+  minor = [f for f in findings if f.get("severity") == "info" or (f.get("source") == "static" and f.get("severity") == "low")]
+  shown = [f for f in findings if verbose or f not in minor]
   if shown:
     print("\nFindings:", file=file)
     for f in shown:
-      where = f"{f['file']}:{f['line']}" if f["line"] else f["file"]
-      tag = paint(f"[{f['severity']}]", SEV_COLORS[f["severity"]])
-      print(f"  {tag} {f['title']}  — {where}  ({f['source']})", file=file)
-      if f["detail"]:
-        print(f"      {f['detail']}", file=file)
+      severity = known(f.get("severity"), SEVERITIES, "medium")
+      where = t(f.get("file")) + (f":{int(f['line'])}" if isinstance(f.get("line"), int) and f["line"] else "")
+      source = known(f.get("source"), ("static", "model"), "model")
+      tag = paint(f"[{severity}]", SEV_COLORS[severity])
+      print(f"  {tag} {prose(f.get('title'))}  — {where}  ({source})", file=file)
+      if f.get("detail"):
+        print(f"      {prose(f['detail'])}", file=file)
   if minor and not verbose:
     print(f"  ({len(minor)} minor findings hidden; show them with -v)", file=file)
-  hosts = report["networkDestinations"]
-  if hosts["model"] or hosts["static"]:
+  hosts = report.get("networkDestinations") or {}
+  model_hosts = [d for d in hosts.get("model") or [] if isinstance(d, dict)]
+  static_hosts = [d for d in hosts.get("static") or [] if isinstance(d, dict)]
+  if model_hosts or static_hosts:
     print("\nNetwork destinations:", file=file)
-    purposes = {d["host"]: d["purpose"] for d in hosts["model"]}
-    for host in sorted(set(purposes) | {d["host"] for d in hosts["static"]}):
-      print(f"  {host}" + (f" — {purposes[host]}" if purposes.get(host) else ""), file=file)
-  nr = report["files"]["notReviewed"]
+    purposes = {str(d.get("host")): d.get("purpose") for d in model_hosts}
+    for host in sorted(set(purposes) | {str(d.get("host")) for d in static_hosts}):
+      print(f"  {t(host)}" + (f" — {prose(purposes[host])}" if purposes.get(host) else ""), file=file)
+  nr = (report.get("files") or {}).get("notReviewed") or []
   if nr:
-    print(f"\nNot reviewed ({len(nr)}): {', '.join(nr[:10])}{' …' if len(nr) > 10 else ''}", file=file)
-  print(f"\nReport: {REPORTS_DIR / (report['scanId'] + '.json')}", file=file)
+    print(f"\nNot reviewed ({len(nr)}): {', '.join(t(n) for n in nr[:10])}{' …' if len(nr) > 10 else ''}", file=file)
+  print(f"\nReport: {t(REPORTS_DIR / (str(report.get('scanId')) + '.json'))}", file=file)
 
 
 def confirm_report(report, question):
   if not sys.stdin.isatty():
     return False
-  default_no = report["verdict"] != "safe"
+  default_no = report.get("verdict") != "safe"
   hint = "[y/N]" if default_no else "[Y/n]"
-  if report["verdict"] == "dangerous":
+  question = term_safe(question)
+  if report.get("verdict") == "dangerous":
     question = paint("This plugin looks DANGEROUS. ", COLORS["dangerous"]) + question
-  try:
-    answer = input(f"\n{question} {hint} ").strip().lower()
-  except EOFError:
+  answer = safe_input(f"\n{question} {hint} ")
+  if not answer:
     return False
+  answer = answer.strip().lower()
   return answer in ("y", "yes") or (answer == "" and not default_no)
 
 
@@ -1476,7 +1565,7 @@ def cmd_models(args, config):
   for m in models:
     mark = "*" if m["id"] == current else " "
     extra = f"  [{m['status']}]" if m.get("status") else ""
-    print(f"{mark} {m['id']:32} {m['label']}{extra}")
+    print(f"{mark} {term_safe(m['id']):32} {term_safe(m['label'])}{term_safe(extra)}")
   if not models:
     print("No models found. Start a local model server or install the claude, codex, or grok CLI.", file=sys.stderr)
   return 0
@@ -1489,7 +1578,7 @@ def cmd_set_model(args, config):
   if args.json:
     print(json.dumps({"ok": True, "model": model["id"], "label": model["label"]}))
   else:
-    print(f"Review model: {model['label']}")
+    print(f"Review model: {term_safe(model['label'])}")
   return 0
 
 
@@ -1526,7 +1615,7 @@ def cmd_sweep(args, config):
     if result["baseline"]:
       print("Recorded the installed plugins; later installs and changes will be checked.", file=sys.stderr)
     for r in result["checked"]:
-      print(f"{r['id']}: {r.get('verdict') or r.get('error')}" + (" (disabled)" if r.get("disabled") else ""), file=sys.stderr)
+      print(f"{term_safe(r['id'])}: {term_safe(r.get('verdict') or r.get('error'), prose=True)}" + (" (disabled)" if r.get("disabled") else ""), file=sys.stderr)
   return finish(args, out, result, "result")
 
 
@@ -1537,10 +1626,10 @@ def human(args):
 def ask(question, default_yes=False):
   if not sys.stdin.isatty():
     return default_yes
-  try:
-    answer = input(f"{question} {'[Y/n]' if default_yes else '[y/N]'} ").strip().lower()
-  except EOFError:
+  answer = safe_input(f"{term_safe(question)} {'[Y/n]' if default_yes else '[y/N]'} ")
+  if not answer:
     return False
+  answer = answer.strip().lower()
   return answer in ("y", "yes") or (answer == "" and default_yes)
 
 
@@ -1567,7 +1656,7 @@ def cmd_add(args, config):
   if not url:
     if not sys.stdin.isatty():
       raise GuardError("a git URL is required")
-    url = input("Plugin git URL: ").strip()
+    url = safe_input("Plugin git URL: ").strip()
     if not url:
       raise GuardError("a git URL is required")
   model = None if args.no_model else resolve_model(config, args.model)
@@ -1645,7 +1734,7 @@ def cmd_update(args, config):
       failed += 1
       results.append({"ok": False, "pluginId": p["id"], "error": str(e)})
       if human(args):
-        print(f"plugin-guard: {p['id']}: {e}", file=sys.stderr)
+        print(f"plugin-guard: {term_safe(p['id'])}: {term_safe(e, prose=True)}", file=sys.stderr)
   finish(args, args.out, {"ok": failed == 0, "results": results}, "result")
   return 1 if failed else 0
 
@@ -1708,6 +1797,8 @@ LOCKED_COMMANDS = {"scan", "add", "install", "update", "apply-update", "check", 
 
 
 def main(argv=None):
+  sys.stdout = SafeWriter(sys.stdout)
+  sys.stderr = SafeWriter(sys.stderr)
   parser = argparse.ArgumentParser(prog="plugin-guard", description="Security-check Omarchy shell plugins before installing them.")
   parser.add_argument("--version", action="version", version=VERSION)
   # Job mode, used by the bar widget: progress and the result go to
@@ -1820,7 +1911,7 @@ def main(argv=None):
       if getattr(args, "json", False):
         print(json.dumps({"ok": False, "error": str(e)}))
       elif not job:
-        print(f"plugin-guard: {e}", file=sys.stderr)
+        print(f"plugin-guard: {term_safe(e, prose=True)}", file=sys.stderr)
     return 1
   except (Cancelled, KeyboardInterrupt):
     if job:
