@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "example.sunny-weather",
+  "name": "Sunny Weather",
+  "version": "1.0.0",
+  "author": "Example",
+  "license": "MIT",
+  "description": "Shows the current temperature in the bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": { "displayName": "Sunny Weather", "category": "Weather", "allowMultiple": false }
+}

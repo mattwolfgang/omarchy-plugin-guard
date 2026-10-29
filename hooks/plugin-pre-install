@@ -1,0 +1,10 @@
+#!/bin/bash
+# Omarchy plugin-pre-install hook: Plugin Guard scans the staged plugin and
+# exits non-zero to refuse a dangerous one. Arguments: <staged-dir> <url> <id>.
+# A missing Plugin Guard allows the install rather than blocking every one.
+guard=${PLUGIN_GUARD_BIN:-$HOME/.local/bin/plugin-guard}
+if [[ ! -x $guard ]]; then
+  echo "Plugin Guard is not installed at $guard; allowing this without a scan" >&2
+  exit 0
+fi
+exec "$guard" gate install "$@"

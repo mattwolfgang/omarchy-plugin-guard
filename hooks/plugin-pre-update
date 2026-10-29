@@ -1,0 +1,11 @@
+#!/bin/bash
+# Omarchy plugin-pre-update hook: Plugin Guard scans the incoming commit and
+# exits non-zero to refuse a dangerous update.
+# Arguments: <plugin-dir> <id> <current-commit> <incoming-commit>.
+# A missing Plugin Guard allows the update rather than blocking every one.
+guard=${PLUGIN_GUARD_BIN:-$HOME/.local/bin/plugin-guard}
+if [[ ! -x $guard ]]; then
+  echo "Plugin Guard is not installed at $guard; allowing this without a scan" >&2
+  exit 0
+fi
+exec "$guard" gate update "$@"

@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mattwolfgang.plugin-guard",
+  "name": "Plugin Guard",
+  "version": "1.0.0",
+  "author": "Matt Wolfgang",
+  "license": "MIT",
+  "description": "Security-check Omarchy plugins before installing or updating them, with static checks plus a review by a local model or the Claude, Codex, or Grok CLI",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Plugin Guard",
+    "description": "Scan a plugin before installing it, pick the review model, and see the scan status of installed plugins",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "autoScan": true
+    },
+    "schema": [
+      {
+        "key": "autoScan",
+        "type": "boolean",
+        "label": "Check plugins installed or changed outside Plugin Guard in the background (reviews them with the selected model, and disables any rated dangerous)",
+        "defaultValue": true
+      }
+    ]
+  }
+}
