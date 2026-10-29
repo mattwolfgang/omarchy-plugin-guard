@@ -52,5 +52,9 @@
     "one": "Plugin Guard: %1 plugin needs a look",
     "other": "Plugin Guard: %1 plugins need a look"
   },
-  "sweep.running": "Background check: %1"
+  "sweep.running": "Background check: %1",
+  "setup.heading": "Finish setting up",
+  "setup.body": "Run setup once to add the plugin-guard command and to check plugins typed into omarchy plugin add or update before they install. It asks before changing your configuration.",
+  "setup.run": "Run setup",
+  "setup.dismiss": "Dismiss"
 }

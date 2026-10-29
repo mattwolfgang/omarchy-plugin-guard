@@ -88,7 +88,7 @@ From the Omarchy Plugin Marketplace, or:
 omarchy plugin add https://github.com/mattwolfgang/omarchy-plugin-guard --enable
 ```
 
-That gives you the bar widget and the background sweep. Then run the installed copy's `install.sh` once, in a terminal:
+That gives you the bar widget and the background sweep. For full functionality, run the installed copy's `install.sh` once. Until it has run, the widget's panel shows a **Run setup** button that opens it in a terminal, and the first background sweep sends a notification about it. **Dismiss** hides the reminder. Or run it yourself:
 
 ```bash
 ~/.config/omarchy/plugins/io.github.mattwolfgang.plugin-guard/install.sh

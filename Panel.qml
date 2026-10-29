@@ -54,6 +54,8 @@ Panel {
   property bool jobStateLoaded: false
   property string jobError: ""
   property string notice: ""
+  // install.sh has not run and the reminder was not dismissed.
+  property bool setupNeeded: false
   property double now: Date.now()
 
   // A unit's heartbeat lands every 5 s; one silent for 30 s has died.
@@ -212,6 +214,19 @@ Panel {
 
   function checkPlugin(p) { runJob("check", p.name || p.id, ["check", p.id]) }
   function checkUpdate(p) { runJob("update", p.name || p.id, ["update", p.id, "--check-only"]) }
+  // install.sh asks questions, so it runs in a terminal. The launcher passes
+  // its arguments through bash -c, hence the quoting.
+  readonly property string installScript: String(Qt.resolvedUrl("install.sh")).replace(/^file:\/\//, "")
+  function runSetup() {
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", Util.shellQuote(installScript)])
+    root.close()
+  }
+
+  function dismissSetup() {
+    setupNeeded = false
+    Quickshell.execDetached(["python3", "-I", guardScript, "setup-state", "dismiss"])
+  }
+
   function cancelJob() {
     if (jobState.unit && alive(jobState)) Quickshell.execDetached(["systemctl", "--user", "stop", String(jobState.unit)])
   }
@@ -321,6 +336,7 @@ Panel {
         try {
           var data = JSON.parse(String(text || ""))
           root.plugins = Array.isArray(data.plugins) ? data.plugins : []
+          root.setupNeeded = data.setupNeeded === true
         } catch (e) {}
       }
     }
@@ -529,6 +545,36 @@ Panel {
             width: parent.width
             spacing: Style.space(12)
             visible: root.view === "home"
+
+            Column {
+              width: parent.width
+              spacing: Style.space(8)
+              visible: root.setupNeeded
+
+              Caption { text: strings.t("setup.heading").toUpperCase() }
+
+              Label {
+                width: parent.width
+                text: strings.t("setup.body")
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Row {
+                spacing: Style.space(6)
+
+                ActionButton {
+                  text: strings.t("setup.run")
+                  onClicked: root.runSetup()
+                }
+
+                ActionButton {
+                  text: strings.t("setup.dismiss")
+                  onClicked: root.dismissSetup()
+                }
+              }
+
+              PanelSeparator { foreground: root.fg }
+            }
 
             Caption { text: strings.t("check.heading").toUpperCase() }
 

@@ -93,5 +93,8 @@ if [[ $enabled != True ]]; then
   omarchy plugin enable "$id" --section "$section"
 fi
 
+# The widget reminds the user to run this script until it has run.
+python3 -I "$dest/bin/plugin-guard" setup-state done
+
 echo "Installed $id to $dest"
 echo "Command: $HOME/.local/bin/plugin-guard"
