@@ -52,7 +52,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -1718,19 +1718,50 @@ def cmd_add(args, config):
     if human(args):
       print(f"Not installed. Install later with: plugin-guard install {report['scanId']}", file=sys.stderr)
     return finish(args, out, {"ok": True, "installed": False, "report": report}, "result")
-  result = install_scanned(report["scanId"], force=args.force, enable=args.enable, section=args.section, out=out)
+  # The bar section is asked for after installing, once the manifest is in
+  # place, so the install itself does not enable the plugin.
+  ask_section = human(args) and not args.yes and not args.section
+  result = install_scanned(report["scanId"], force=args.force, enable=args.enable and not ask_section,
+                           section=args.section, out=out)
   result["report"] = report
   if human(args):
-    print(f"Installed {result['pluginId']}" + (" and enabled it" if result["enabled"] else ""), file=sys.stderr)
-    if not result["enabled"] and not args.yes and ask(f"Enable {result['pluginId']} now?", report["verdict"] == "safe"):
-      # Not captured, so omarchy can ask where to put a bar widget.
-      wait_until_known(result["pluginId"])
-      result["enabled"] = subprocess.run(["omarchy", "plugin", "enable", result["pluginId"]]).returncode == 0
+    plugin_id = result["pluginId"]
+    if result["enabled"]:
+      print(f"Installed {plugin_id} and enabled it", file=sys.stderr)
+    else:
+      print(f"Installed {plugin_id}", file=sys.stderr)
+      if args.enable or (not args.yes and ask(f"Enable {plugin_id} now?", report["verdict"] == "safe")):
+        try:
+          enable_plugin(plugin_id, ask_bar_section(plugin_id) if ask_section else args.section)
+          result["enabled"] = True
+          print(f"Enabled {plugin_id}", file=sys.stderr)
+        except GuardError as e:
+          print(f"plugin-guard: {term_safe(e, prose=True)}", file=sys.stderr)
       if not result["enabled"]:
-        print(f"Not enabled. Enable it later with: omarchy plugin enable {result['pluginId']}", file=sys.stderr)
-    elif not result["enabled"]:
-      print(f"Enable it later with: omarchy plugin enable {result['pluginId']}", file=sys.stderr)
+        print(f"Enable it later with: omarchy plugin enable {plugin_id}", file=sys.stderr)
   return finish(args, out, result, "result")
+
+
+BAR_SECTIONS = ["left", "centerBegin", "center", "centerEnd", "tray", "right"]
+
+
+def ask_bar_section(plugin_id):
+  """Ask where to put a bar widget, as `omarchy plugin add` does when it
+  enables one itself. Returns "" (Omarchy's default placement) for a plugin
+  that is not a bar widget, or when nothing is chosen."""
+  manifest = read_json(PLUGINS_DIR / plugin_id / "manifest.json", {})
+  kinds = manifest.get("kinds") or []
+  if "bar-widget" not in kinds or "bar" in kinds or not sys.stdin.isatty():
+    return ""
+  # A manifest's center means beside the clock, which is centerEnd.
+  default = (manifest.get("barWidget") or {}).get("defaultSection") or "centerEnd"
+  default = "centerEnd" if default == "center" or default not in BAR_SECTIONS else default
+  if shutil.which("gum"):
+    r = subprocess.run(["gum", "choose", f"--header=Where in the bar should {plugin_id} go?",
+                        f"--selected={default}"] + BAR_SECTIONS, stdout=subprocess.PIPE, text=True)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() in BAR_SECTIONS else ""
+  answer = safe_input(f"Bar section for {term_safe(plugin_id)} ({', '.join(BAR_SECTIONS)}) [{default}]: ").strip()
+  return answer if answer in BAR_SECTIONS else default
 
 
 def cmd_install(args, config):
