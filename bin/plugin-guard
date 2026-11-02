@@ -53,7 +53,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -563,8 +563,10 @@ RULES = [
   ("listen-socket", "medium", "remote-access", "Opens a listening network socket",
    rx(r"\.bind\(\s*\(\s*[\"'](0\.0\.0\.0|::|)[\"']|\bnc(at)?\b[^\n]*\s-l|SocketServer\s*\{|\bserve_forever\(|http\.server")),
   # Input capture
-  ("input-device", "critical", "input-capture", "Reads raw input devices (keylogging)",
-   rx(r"/dev/input/(event|by-)|\bevtest\b|libinput\s+debug-events|\bshowkey\b|\bxinput\s+(test|query-state)|\bimport\s+evdev\b|from\s+evdev\b|\bpynput\b|\bkeyboard\.on_press\b")),
+  ("input-device", "critical", "input-capture", "Reads raw input devices (possible keylogging)",
+   rx(r"\bopen\s*\([^\n]*/dev/input/(event|by-)|/dev/input/(event|by-)[^\n]*\.(open|read\w*)\s*\(|\b(cat|dd|od|xxd|hexdump|head|tail)\b[^\n|;]*/dev/input/(event|by-)|<\s*[\"']?/dev/input/(event|by-)|\bevtest\b|libinput\s+debug-events|\bshowkey\b|\bxinput\s+(test|query-state)|\bimport\s+evdev\b|from\s+evdev\b|\bpynput\b|\bkeyboard\.on_press\b")),
+  ("input-device-path", "high", "input-capture", "Refers to a raw input device",
+   rx(r"/dev/input/(event|by-)")),
   ("input-injection", "medium", "input-capture", "Types or clicks on the user's behalf",
    rx(r"\b(ydotool|wtype|xdotool)\b")),
   ("screen-capture", "low", "input-capture", "Captures the screen or clipboard",
@@ -583,11 +585,13 @@ RULES = [
    rx(r"systemctl\s+(--user\s+)?enable|\.config/systemd/user|/etc/systemd/system")),
   ("cron", "medium", "persistence", "Schedules a cron job",
    rx(r"\bcrontab\b|/etc/cron")),
-  ("autostart", "medium", "persistence", "Adds a login autostart or shell profile entry",
-   rx(r"\.config/autostart|(~|\$HOME|\$\{HOME\}|/home/[^/\s\"']+|\bhome\(\)|Path\.home\(\))[\"']?\s*[/,+]?\s*[\"']?/?\.(bashrc|zshrc|bash_profile|profile|zprofile|zshenv)\b|\bexec-once\b|\.config/hypr/")),
+  ("autostart", "medium", "persistence", "Adds a login autostart, shell profile, or Hyprland config entry",
+   rx(r"\.config/autostart|(~|\$HOME|\$\{HOME\}|/home/[^/\s\"']+|\bhome\(\)|Path\.home\(\))[\"']?\s*[/,+]?\s*[\"']?/?\.(bashrc|zshrc|bash_profile|profile|zprofile|zshenv)\b|\bexec-once\b|(>|\b(tee|cp|mv|install|ln|rsync|touch)\b[^\n|;]*|\bsed\s+(-[a-zA-Z-]+\s+)*-i[^\n|;]*)\s*[\"']?[^\s|;&]*\.config/hypr/|\bopen\s*\([^\n]*\.config/hypr/[^\n]*,\s*[\"'][^\"']*[awx+]|\.config/hypr/[^\n]*\.write(_text|_bytes)?\s*\(")),
+  ("hypr-config-path", "low", "persistence", "Refers to the Hyprland config",
+   rx(r"\.config/hypr/")),
   # Privilege
   ("privilege", "medium", "privilege", "Requests elevated privileges",
-   rx(r"\bsudo\b|\bpkexec\b|\bdoas\b|\bsetcap\b|chmod\s+[ugoa]*\+s\b|chmod\s+[0-7]?[4-7][0-7]{3}\b")),
+   rx(r"(?<!-)\bsudo\b|\bpkexec\b|\bdoas\b|\bsetcap\b|chmod\s+[ugoa]*\+s\b|chmod\s+[0-7]?[4-7][0-7]{3}\b")),
   ("sudoers", "high", "privilege", "Changes sudo or polkit rules",
    rx(r"/etc/sudoers|polkit-1/rules\.d|/etc/pam\.d")),
   # Destructive
@@ -629,6 +633,15 @@ TEST_PATH_RE = re.compile(r"(^|/)(tests?|spec|__tests__|fixtures?|examples?|\.gi
 COMMENT_RE = re.compile(r"^\s*(#(?!!)|//|/\*|\*|--|;|<!--)")
 FULL_WEIGHT_RULES = {"prompt-injection", "bidi-control"}
 
+# A broad rule stays quiet on a line its specific rule already reported.
+BROADER_RULES = {"input-device-path": "input-device", "hypr-config-path": "autostart"}
+
+# Opening a device on one line and reading it on another hides from the
+# line-based input-device rule, so a file that names a device and also reads
+# fixed-size records or waits on file descriptors counts as reading it.
+INPUT_PATH_RE = rx(r"/dev/input/(event|by-)")
+EVENT_READ_RE = rx(r"\bos\.read\s*\(|\.read\s*\(\s*\d+|\.read\s*\(\s*\w*(size|len)\b|\bstruct\.(unpack|iter_unpack|calcsize)\s*\(|\bselect\.(select|poll|epoll)\s*\(|\bselectors\.|\binput_event\b")
+
 
 def downgrade(severity, levels):
   return SEVERITIES[max(0, SEVERITIES.index(severity) - levels)]
@@ -645,6 +658,7 @@ def static_scan(files):
     is_doc = Path(rel).suffix.lower() in DOC_EXTENSIONS or Path(rel).name.upper().startswith(("LICENSE", "COPYING"))
     in_tests = bool(TEST_PATH_RE.search(rel))
     counts = {}
+    input_path_line = 0
     for lineno, line in enumerate(text.splitlines(), 1):
       context = "test" if in_tests else ("comment" if COMMENT_RE.match(line) else "")
       if BIDI_RE.search(line):
@@ -660,12 +674,18 @@ def static_scan(files):
         if ip not in LOCAL_HOSTS and not ip.startswith(("10.", "192.168.", "127.")):
           findings.append(finding("medium", "network", "ip-address-url", rel, lineno,
                                   "Connects to a bare IP address", line.strip()))
+      if not input_path_line and not context and INPUT_PATH_RE.search(line):
+        input_path_line = lineno
+      line_rules = set()
       for rule, sev, cat, title, pattern in RULES:
         # Documentation mentions commands (install instructions) rather than
         # running them; only text aimed at AI reviewers matters there.
         if is_doc and rule != "prompt-injection":
           continue
         if not pattern.search(line):
+          continue
+        line_rules.add(rule)
+        if BROADER_RULES.get(rule) in line_rules:
           continue
         n = counts.get(rule, 0) + 1
         counts[rule] = n
@@ -675,6 +695,10 @@ def static_scan(files):
           if weighted != sev:
             f["matchSeverity"] = sev
           findings.append(f)
+    if input_path_line and not is_doc and "input-device" not in counts and EVENT_READ_RE.search(text):
+      findings.append(finding("critical", "input-capture", "input-device", rel, input_path_line,
+                              "Reads raw input devices (possible keylogging)",
+                              text.splitlines()[input_path_line - 1].strip()))
     if ZERO_WIDTH_RE.search(text) and not is_doc:
       findings.append(finding("low", "obfuscation", "zero-width", rel, 0, "Contains zero-width characters", ""))
     for rule, n in counts.items():

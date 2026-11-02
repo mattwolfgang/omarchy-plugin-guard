@@ -51,6 +51,51 @@ if r["modelVerdict"] not in (None, "safe"): print("  model verdict:", r["modelVe
 sys.exit(1 if bad or r["staticVerdict"] != "safe" or r["modelVerdict"] not in (None, "safe") else 0)
 '
 
+# --- Rule precision ---------------------------------------------------------
+#
+# Mentions must not count as actions, and splitting a read across lines must
+# not lower the rating. Each case: file text, rules it must report at the given
+# severity, and rules it must not report.
+
+if python3 -I - "$guard" <<'EOF'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("plugin_guard", sys.argv[1])
+spec = importlib.util.spec_from_loader("plugin_guard", loader)
+pg = importlib.util.module_from_spec(spec)
+loader.exec_module(pg)
+cases = [
+  ('"""Exits when /dev/input/event* sees a key."""\n', {"input-device-path": "high"}, {"input-device"}),
+  ('dev = open("/dev/input/event3", "rb")\n', {"input-device": "critical"}, {"input-device-path"}),
+  ('cat /dev/input/event3 > /tmp/x\n', {"input-device": "critical"}, set()),
+  ('read x < /dev/input/by-id/kbd\n', {"input-device": "critical"}, set()),
+  ('p = "/dev/input/event3"\nd = open(p, "rb")\nd.read(24)\n', {"input-device": "critical"}, set()),
+  ('# reads /dev/input/event3\nx = os.read(0, 24)\n', {}, {"input-device"}),
+  ('import evdev\n', {"input-device": "critical"}, set()),
+  ('install.sh --no-sudo\n', {}, {"privilege"}),
+  ('sudo pacman -S jq\n', {"privilege": "medium"}, set()),
+  ('/usr/bin/sudo id\n', {"privilege": "medium"}, set()),
+  ('cat "$HOME/.config/hypr/hyprland.conf"\n', {"hypr-config-path": "low"}, {"autostart"}),
+  ('echo x >> ~/.config/hypr/hyprland.conf\n', {"autostart": "medium"}, {"hypr-config-path"}),
+  ("sed -i 's/a/b/' ~/.config/hypr/bindings.lua\n", {"autostart": "medium"}, set()),
+  ('cp a.conf ~/.config/hypr/a.conf\n', {"autostart": "medium"}, set()),
+  ('f = open(home + "/.config/hypr/a.conf", "a")\n', {"autostart": "medium"}, set()),
+  ('exec-once = thing\n', {"autostart": "medium"}, set()),
+]
+bad = 0
+for text, want, absent in cases:
+  found = {f["rule"]: f["severity"] for f in pg.static_scan([{"path": "tool", "text": text}])[0]}
+  if any(found.get(r) != s for r, s in want.items()) or absent & set(found):
+    print("  wrong:", repr(text), found)
+    bad = 1
+sys.exit(bad)
+EOF
+then
+  echo "ok   rules separate mentions from actions"
+else
+  echo "FAIL rules separate mentions from actions"
+  failed=1
+fi
+
 # --- Terminal safety --------------------------------------------------------
 #
 # A repository controls a plugin's name and every file the model reads, so the
