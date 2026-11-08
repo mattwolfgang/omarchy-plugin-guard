@@ -51,6 +51,51 @@ if r["modelVerdict"] not in (None, "safe"): print("  model verdict:", r["modelVe
 sys.exit(1 if bad or r["staticVerdict"] != "safe" or r["modelVerdict"] not in (None, "safe") else 0)
 '
 
+# --- Rule precision ---------------------------------------------------------
+#
+# Mentions must not count as actions, and splitting a read across lines must
+# not lower the rating. Each case: file text, rules it must report at the given
+# severity, and rules it must not report.
+
+if python3 -I - "$guard" <<'EOF'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("plugin_guard", sys.argv[1])
+spec = importlib.util.spec_from_loader("plugin_guard", loader)
+pg = importlib.util.module_from_spec(spec)
+loader.exec_module(pg)
+cases = [
+  ('"""Exits when /dev/input/event* sees a key."""\n', {"input-device-path": "high"}, {"input-device"}),
+  ('dev = open("/dev/input/event3", "rb")\n', {"input-device": "critical"}, {"input-device-path"}),
+  ('cat /dev/input/event3 > /tmp/x\n', {"input-device": "critical"}, set()),
+  ('read x < /dev/input/by-id/kbd\n', {"input-device": "critical"}, set()),
+  ('p = "/dev/input/event3"\nd = open(p, "rb")\nd.read(24)\n', {"input-device": "critical"}, set()),
+  ('# reads /dev/input/event3\nx = os.read(0, 24)\n', {}, {"input-device"}),
+  ('import evdev\n', {"input-device": "critical"}, set()),
+  ('install.sh --no-sudo\n', {}, {"privilege"}),
+  ('sudo pacman -S jq\n', {"privilege": "medium"}, set()),
+  ('/usr/bin/sudo id\n', {"privilege": "medium"}, set()),
+  ('cat "$HOME/.config/hypr/hyprland.conf"\n', {"hypr-config-path": "low"}, {"autostart"}),
+  ('echo x >> ~/.config/hypr/hyprland.conf\n', {"autostart": "medium"}, {"hypr-config-path"}),
+  ("sed -i 's/a/b/' ~/.config/hypr/bindings.lua\n", {"autostart": "medium"}, set()),
+  ('cp a.conf ~/.config/hypr/a.conf\n', {"autostart": "medium"}, set()),
+  ('f = open(home + "/.config/hypr/a.conf", "a")\n', {"autostart": "medium"}, set()),
+  ('exec-once = thing\n', {"autostart": "medium"}, set()),
+]
+bad = 0
+for text, want, absent in cases:
+  found = {f["rule"]: f["severity"] for f in pg.static_scan([{"path": "tool", "text": text}])[0]}
+  if any(found.get(r) != s for r, s in want.items()) or absent & set(found):
+    print("  wrong:", repr(text), found)
+    bad = 1
+sys.exit(bad)
+EOF
+then
+  echo "ok   rules separate mentions from actions"
+else
+  echo "FAIL rules separate mentions from actions"
+  failed=1
+fi
+
 # --- Terminal safety --------------------------------------------------------
 #
 # A repository controls a plugin's name and every file the model reads, so the
@@ -130,6 +175,64 @@ terminal_check() {
 terminal_check "hostile manifest in a scan report" "$guard" scan "$work/hostile-plugin" --no-model
 terminal_check "hostile model and repository fields in a saved report" "$guard" report hostile-report -v
 terminal_check "hostile text in progress and error output" "$guard" scan "$(cat "$work/hostile-path")" --no-model
+
+# --- Marketplace-verified plugins -------------------------------------------
+#
+# A plugin is skipped only at the exact commit the marketplace verified, with
+# no local changes, and --scan-all scans it anyway.
+
+verified_check() {
+  local name=$1 want=$2
+  shift 2
+  rm -f "$XDG_STATE_HOME/plugin-guard/marketplace.json"
+  local got
+  got=$("$guard" scan "$work/verified" --no-model --json "$@" 2>/dev/null |
+    python3 -I -c 'import json, sys; print(bool(json.load(sys.stdin).get("marketplaceVerified")))')
+  if [[ $got == "$want" ]]; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name (skipped: $got)"
+    failed=1
+  fi
+}
+
+cp -r "$here/fixtures/clean-clock" "$work/verified"
+git -C "$work/verified" init -q
+git -C "$work/verified" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
+  commit -q --allow-empty -m init
+git -C "$work/verified" add -A
+git -C "$work/verified" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
+  commit -q -m files
+verified_id=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$work/verified/manifest.json")
+verified_head=$(git -C "$work/verified" rev-parse HEAD)
+export PLUGIN_GUARD_CATALOG_URL="file://$work/catalog.json"
+write_catalog() {
+  printf '{"plugins":[{"id":"%s","verificationStatus":"%s","verificationCommit":"%s"}]}\n' \
+    "$verified_id" "$1" "$2" >"$work/catalog.json"
+}
+
+write_catalog verified "$verified_head"
+verified_check "verified plugin at its verified commit is skipped" True
+verified_check "--scan-all scans a verified plugin" False --scan-all
+write_catalog unverified "$verified_head"
+verified_check "unverified plugin is scanned" False
+write_catalog verified "$(git -C "$work/verified" rev-parse HEAD~1)"
+verified_check "verified plugin at another commit is scanned" False
+write_catalog verified "$verified_head"
+(
+  # The saved setting, in a config of its own so a --model run's real config
+  # is untouched.
+  export XDG_CONFIG_HOME="$work/scan-all-config"
+  "$guard" scan-all on >/dev/null
+  verified_check "scan-all on scans a verified plugin" False
+  verified_check "--skip-verified overrides scan-all on" True --skip-verified
+  "$guard" scan-all off >/dev/null
+  verified_check "scan-all off skips a verified plugin" True
+  exit $failed
+) || failed=1
+echo "// local change" >>"$work/verified/BarWidget.qml"
+verified_check "verified plugin with local changes is scanned" False
+unset PLUGIN_GUARD_CATALOG_URL
 
 # Notifications and prompts use the same escaping.
 if python3 -I - "$guard" <<'EOF'

@@ -11,7 +11,7 @@ It comes as a bar widget and a `plugin-guard` command.
 ## How a scan works
 
 1. **Fetch without running anything.** The repository is cloned with git hooks, submodules, and LFS downloads disabled, into `~/.local/state/plugin-guard/stages/`.
-2. **Static checks.** Fixed patterns run over every file: reverse shells, piped-to-shell downloads, remote QML, raw input-device reads, remote-access and tunnelling tools, credential and browser-profile paths, persistence (services, cron, shell profiles, Hyprland config), privilege escalation, destructive commands, miners, encoded blobs, hidden Unicode, prebuilt binaries, and text that tries to instruct an AI reviewer. Matches in tests, CI, and comments count for less, because they describe behavior rather than perform it.
+2. **Static checks.** Fixed patterns run over every file: reverse shells, piped-to-shell downloads, remote QML, raw input-device reads, remote-access and tunnelling tools, credential and browser-profile paths, persistence (services, cron, shell profiles, Hyprland config), privilege escalation, destructive commands, miners, encoded blobs, hidden Unicode, prebuilt binaries, and text that tries to instruct an AI reviewer. Matches in tests, CI, and comments count for less, because they describe behavior rather than perform it. A file that only names an input device rates high; one that also reads it rates critical. Naming the Hyprland config is noted, and writing to it counts as persistence.
 3. **Model review.** The code, the manifest, and the static findings go to the model you picked. The model judges whether the plugin does anything harmful or beyond its declared purpose, and lists every network destination with what it is for.
 4. **Verdict:** `safe`, `caution`, or `dangerous`. The static checks set a floor. A critical match means at least `dangerous`, and a high-severity match at least `caution`. The model can raise the verdict but never lower it, so a plugin cannot talk its way past the static checks. A scan whose model review fails is never `safe`.
 
@@ -19,6 +19,26 @@ Installs and updates use exactly the commit that was scanned:
 
 - `install` hands the scanned clone itself to `omarchy plugin add`, then points the remote back at the real repository.
 - `update` fetches the new commit into the plugin's repository, scans that commit in a separate checkout, and fast-forwards to it only when you approve.
+
+## Plugins verified in the marketplace
+
+Starting with version 1.0.7, Plugin Guard skips plugins that the [Omarchy Plugin Marketplace](https://plugins.omarchy.org/) lists as verified, and says so when a scan starts. The marketplace verifies a plugin at one commit, so Plugin Guard skips only that exact commit, and only when the plugin's files are unchanged from it. An update to a verified plugin, a plugin with local changes, and a fork that reuses a verified plugin's id are all scanned as usual. A skipped plugin is reported as `safe`, with a note that it was verified rather than scanned.
+
+The marketplace catalog is fetched from `https://plugins.omarchy.org/catalog.json` and cached for six hours in `~/.local/state/plugin-guard/marketplace.json`. If it cannot be fetched and the cache is more than a day old, nothing is skipped.
+
+To scan everything, verified plugins included, turn on **Scan verified plugins too** in the widget's panel, or run:
+
+```bash
+plugin-guard scan-all on     # scan verified plugins too
+plugin-guard scan-all off    # skip them again (the default)
+plugin-guard scan-all        # show the current setting
+```
+
+The setting is saved in `~/.config/plugin-guard/config.json` (`"scanAll"`), so the background sweep and the pre-install and pre-update hooks follow it too. To override it for one run, pass `--scan-all` or `--skip-verified` to `scan`, `add`, `update`, `check`, `sweep`, or `gate`:
+
+```bash
+plugin-guard add https://github.com/owner/plugin --scan-all
+```
 
 ## What it covers
 
@@ -55,6 +75,7 @@ A shield icon in the bar:
 Click it to open the panel:
 
 - **Model picker.** Pick from every local and frontier model that is available.
+- **Scan verified plugins too.** Off by default, so plugins verified in the Omarchy Plugin Marketplace are skipped. Turn it on to scan them as well, in the background check and before installs too.
 - **Check a plugin before installing.** Paste a git URL and press Scan. The report shows the verdict, a plain-language summary, whether the code matches its stated purpose, the findings with file and line, the network destinations, and the files that could not be reviewed. From the report, Install or Install and enable. A dangerous plugin needs a second click.
 - **Plugin Guard updates.** When a newer Plugin Guard is on GitHub, the panel shows its version and the commits it adds, with an **Update Plugin Guard** button. It checks when the panel opens, at most every six hours.
 - **Installed plugins.** Each plugin shows its latest result. Scan checks it in place. Update scans the incoming upstream update and offers Apply update.
@@ -75,8 +96,11 @@ plugin-guard check <plugin-id>          # scan an installed plugin in place
 plugin-guard sweep                      # check plugins installed or changed outside Plugin Guard
 plugin-guard status                     # installed plugins and their results
 plugin-guard self-update                # update Plugin Guard itself (--check to only look)
+plugin-guard scan-all on|off            # scan marketplace-verified plugins too, or skip them
 plugin-guard report <scan-id|plugin-id> # show a saved report
 ```
+
+Plugins verified in the Omarchy Plugin Marketplace are skipped unless `plugin-guard scan-all on` is set. Add `--scan-all` or `--skip-verified` to any scan to override that setting for one run.
 
 Add `--model <id>` to any scan to override the current model, `--no-model` for static checks only, `-v` to include minor findings, and `--json` for machine-readable output.
 

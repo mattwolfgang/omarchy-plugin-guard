@@ -22,6 +22,7 @@
   "report.model": "Reviewed by %1",
   "report.static": "Static checks: %1 · Model: %2",
   "report.notRun": "not run",
+  "report.marketplaceVerified": "Verified in the Omarchy Plugin Marketplace at this commit; not scanned",
   "report.modelFailed": "Model review failed: %1",
   "report.purpose": "Purpose",
   "report.findings": "Findings",
@@ -53,6 +54,8 @@
     "other": "Plugin Guard: %1 plugins need a look"
   },
   "sweep.running": "Background check: %1",
+  "scanAll.label": "Scan verified plugins too",
+  "scanAll.description": "Plugins verified in the Omarchy Plugin Marketplace are skipped at the commit the marketplace verified. Turn this on to scan them anyway, including in the background check and before installs.",
   "setup.heading": "Finish setting up",
   "setup.body": "Run setup once to add the plugin-guard command and to check plugins typed into omarchy plugin add or update before they install. It asks before changing your configuration.",
   "setup.run": "Run setup",

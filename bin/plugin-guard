@@ -18,6 +18,11 @@ cannot talk its way past them.
 
 Installs and updates use exactly the commit that was scanned.
 
+Plugins verified in the Omarchy Plugin Marketplace are skipped, but only at
+the exact commit the marketplace verified, with no local changes.
+`scan-all on` scans them too, everywhere (hooks and the widget included);
+--scan-all and --skip-verified override that setting for one run.
+
 Commands (all accept --json; scan, add, install, and update accept --events
 for NDJSON progress on stdout):
 
@@ -32,6 +37,7 @@ for NDJSON progress on stdout):
   status                     installed plugins and their latest scan results
   report <scan-id|plugin-id> show a saved report
   self-update [--check]      update Plugin Guard itself from its repository
+  scan-all [on|off]          scan plugins verified in the marketplace too, or skip them
   setup-state done|dismiss   record that install.sh ran, or hide the reminder to run it
 """
 import argparse
@@ -53,7 +59,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.5"
+VERSION = "1.0.7"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -85,6 +91,10 @@ DEFAULT_CONFIG = {
   # Ask before applying an update rated safe. Caution and dangerous updates,
   # and new installs, are always asked about.
   "confirmSafeUpdates": False,
+  # Scan plugins verified in the Omarchy Plugin Marketplace too, instead of
+  # skipping them. Set with `plugin-guard scan-all on|off` or the widget; the
+  # pre-install hooks and the background sweep follow it.
+  "scanAll": False,
 }
 
 # Scan limits. Files beyond them are reported as not reviewed.
@@ -563,8 +573,10 @@ RULES = [
   ("listen-socket", "medium", "remote-access", "Opens a listening network socket",
    rx(r"\.bind\(\s*\(\s*[\"'](0\.0\.0\.0|::|)[\"']|\bnc(at)?\b[^\n]*\s-l|SocketServer\s*\{|\bserve_forever\(|http\.server")),
   # Input capture
-  ("input-device", "critical", "input-capture", "Reads raw input devices (keylogging)",
-   rx(r"/dev/input/(event|by-)|\bevtest\b|libinput\s+debug-events|\bshowkey\b|\bxinput\s+(test|query-state)|\bimport\s+evdev\b|from\s+evdev\b|\bpynput\b|\bkeyboard\.on_press\b")),
+  ("input-device", "critical", "input-capture", "Reads raw input devices (possible keylogging)",
+   rx(r"\bopen\s*\([^\n]*/dev/input/(event|by-)|/dev/input/(event|by-)[^\n]*\.(open|read\w*)\s*\(|\b(cat|dd|od|xxd|hexdump|head|tail)\b[^\n|;]*/dev/input/(event|by-)|<\s*[\"']?/dev/input/(event|by-)|\bevtest\b|libinput\s+debug-events|\bshowkey\b|\bxinput\s+(test|query-state)|\bimport\s+evdev\b|from\s+evdev\b|\bpynput\b|\bkeyboard\.on_press\b")),
+  ("input-device-path", "high", "input-capture", "Refers to a raw input device",
+   rx(r"/dev/input/(event|by-)")),
   ("input-injection", "medium", "input-capture", "Types or clicks on the user's behalf",
    rx(r"\b(ydotool|wtype|xdotool)\b")),
   ("screen-capture", "low", "input-capture", "Captures the screen or clipboard",
@@ -583,11 +595,13 @@ RULES = [
    rx(r"systemctl\s+(--user\s+)?enable|\.config/systemd/user|/etc/systemd/system")),
   ("cron", "medium", "persistence", "Schedules a cron job",
    rx(r"\bcrontab\b|/etc/cron")),
-  ("autostart", "medium", "persistence", "Adds a login autostart or shell profile entry",
-   rx(r"\.config/autostart|(~|\$HOME|\$\{HOME\}|/home/[^/\s\"']+|\bhome\(\)|Path\.home\(\))[\"']?\s*[/,+]?\s*[\"']?/?\.(bashrc|zshrc|bash_profile|profile|zprofile|zshenv)\b|\bexec-once\b|\.config/hypr/")),
+  ("autostart", "medium", "persistence", "Adds a login autostart, shell profile, or Hyprland config entry",
+   rx(r"\.config/autostart|(~|\$HOME|\$\{HOME\}|/home/[^/\s\"']+|\bhome\(\)|Path\.home\(\))[\"']?\s*[/,+]?\s*[\"']?/?\.(bashrc|zshrc|bash_profile|profile|zprofile|zshenv)\b|\bexec-once\b|(>|\b(tee|cp|mv|install|ln|rsync|touch)\b[^\n|;]*|\bsed\s+(-[a-zA-Z-]+\s+)*-i[^\n|;]*)\s*[\"']?[^\s|;&]*\.config/hypr/|\bopen\s*\([^\n]*\.config/hypr/[^\n]*,\s*[\"'][^\"']*[awx+]|\.config/hypr/[^\n]*\.write(_text|_bytes)?\s*\(")),
+  ("hypr-config-path", "low", "persistence", "Refers to the Hyprland config",
+   rx(r"\.config/hypr/")),
   # Privilege
   ("privilege", "medium", "privilege", "Requests elevated privileges",
-   rx(r"\bsudo\b|\bpkexec\b|\bdoas\b|\bsetcap\b|chmod\s+[ugoa]*\+s\b|chmod\s+[0-7]?[4-7][0-7]{3}\b")),
+   rx(r"(?<!-)\bsudo\b|\bpkexec\b|\bdoas\b|\bsetcap\b|chmod\s+[ugoa]*\+s\b|chmod\s+[0-7]?[4-7][0-7]{3}\b")),
   ("sudoers", "high", "privilege", "Changes sudo or polkit rules",
    rx(r"/etc/sudoers|polkit-1/rules\.d|/etc/pam\.d")),
   # Destructive
@@ -629,6 +643,15 @@ TEST_PATH_RE = re.compile(r"(^|/)(tests?|spec|__tests__|fixtures?|examples?|\.gi
 COMMENT_RE = re.compile(r"^\s*(#(?!!)|//|/\*|\*|--|;|<!--)")
 FULL_WEIGHT_RULES = {"prompt-injection", "bidi-control"}
 
+# A broad rule stays quiet on a line its specific rule already reported.
+BROADER_RULES = {"input-device-path": "input-device", "hypr-config-path": "autostart"}
+
+# Opening a device on one line and reading it on another hides from the
+# line-based input-device rule, so a file that names a device and also reads
+# fixed-size records or waits on file descriptors counts as reading it.
+INPUT_PATH_RE = rx(r"/dev/input/(event|by-)")
+EVENT_READ_RE = rx(r"\bos\.read\s*\(|\.read\s*\(\s*\d+|\.read\s*\(\s*\w*(size|len)\b|\bstruct\.(unpack|iter_unpack|calcsize)\s*\(|\bselect\.(select|poll|epoll)\s*\(|\bselectors\.|\binput_event\b")
+
 
 def downgrade(severity, levels):
   return SEVERITIES[max(0, SEVERITIES.index(severity) - levels)]
@@ -645,6 +668,7 @@ def static_scan(files):
     is_doc = Path(rel).suffix.lower() in DOC_EXTENSIONS or Path(rel).name.upper().startswith(("LICENSE", "COPYING"))
     in_tests = bool(TEST_PATH_RE.search(rel))
     counts = {}
+    input_path_line = 0
     for lineno, line in enumerate(text.splitlines(), 1):
       context = "test" if in_tests else ("comment" if COMMENT_RE.match(line) else "")
       if BIDI_RE.search(line):
@@ -660,12 +684,18 @@ def static_scan(files):
         if ip not in LOCAL_HOSTS and not ip.startswith(("10.", "192.168.", "127.")):
           findings.append(finding("medium", "network", "ip-address-url", rel, lineno,
                                   "Connects to a bare IP address", line.strip()))
+      if not input_path_line and not context and INPUT_PATH_RE.search(line):
+        input_path_line = lineno
+      line_rules = set()
       for rule, sev, cat, title, pattern in RULES:
         # Documentation mentions commands (install instructions) rather than
         # running them; only text aimed at AI reviewers matters there.
         if is_doc and rule != "prompt-injection":
           continue
         if not pattern.search(line):
+          continue
+        line_rules.add(rule)
+        if BROADER_RULES.get(rule) in line_rules:
           continue
         n = counts.get(rule, 0) + 1
         counts[rule] = n
@@ -675,6 +705,10 @@ def static_scan(files):
           if weighted != sev:
             f["matchSeverity"] = sev
           findings.append(f)
+    if input_path_line and not is_doc and "input-device" not in counts and EVENT_READ_RE.search(text):
+      findings.append(finding("critical", "input-capture", "input-device", rel, input_path_line,
+                              "Reads raw input devices (possible keylogging)",
+                              text.splitlines()[input_path_line - 1].strip()))
     if ZERO_WIDTH_RE.search(text) and not is_doc:
       findings.append(finding("low", "obfuscation", "zero-width", rel, 0, "Contains zero-width characters", ""))
     for rule, n in counts.items():
@@ -1004,9 +1038,135 @@ def read_manifest(root):
   return manifest
 
 
+# --------------------------------------------------------------------- marketplace
+#
+# Plugins verified in the Omarchy Plugin Marketplace are not scanned. The
+# marketplace verifies a plugin at one commit, so only that exact commit is
+# skipped: an update to a verified plugin, a local change, or a fork that
+# reuses the id is scanned as usual. --scan-all turns the skip off.
+
+MARKETPLACE_URL = os.environ.get("PLUGIN_GUARD_CATALOG_URL") or "https://plugins.omarchy.org/catalog.json"
+MARKETPLACE_FILE = STATE_DIR / "marketplace.json"
+MARKETPLACE_MAX_AGE = 6 * 3600
+# A cached catalog older than this is not trusted, since the marketplace can
+# withdraw a verification.
+MARKETPLACE_STALE_AGE = 24 * 3600
+MARKETPLACE_MAX_BYTES = 64 * 1024 * 1024
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+
+SKIP_VERIFIED_NOTE = ("Skipping plugins verified in the Omarchy Plugin Marketplace at the commit being checked; "
+                      "pass --scan-all to scan them too, or turn that on for every scan with: plugin-guard scan-all on")
+SCAN_ALL_NOTE = "Scanning every plugin, including ones verified in the Omarchy Plugin Marketplace"
+SCAN_ALL_FLAG = " (--scan-all)"
+SCAN_ALL_SETTING = " (scan-all is on; turn it off with: plugin-guard scan-all off)"
+
+
+def catalog_age(cached):
+  try:
+    return (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(cached["fetchedAt"])).total_seconds()
+  except (KeyError, TypeError, ValueError):
+    return None
+
+
+def marketplace_catalog(out):
+  """Map of plugin id to the commit the marketplace verified, or None when
+  the catalog cannot be had. Cached, so a sweep of many plugins fetches once."""
+  cached = read_json(MARKETPLACE_FILE, {})
+  if not isinstance(cached, dict) or cached.get("url") != MARKETPLACE_URL:
+    cached = {}
+  age = catalog_age(cached)
+  if age is not None and 0 <= age < MARKETPLACE_MAX_AGE and isinstance(cached.get("verified"), dict):
+    return cached["verified"]
+  out.progress("marketplace", "Checking the Omarchy Plugin Marketplace for verified plugins")
+  try:
+    req = urllib.request.Request(MARKETPLACE_URL, headers={"User-Agent": f"plugin-guard/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+      data = r.read(MARKETPLACE_MAX_BYTES + 1)
+    if len(data) > MARKETPLACE_MAX_BYTES:
+      raise ValueError("the catalog is unreasonably large")
+    catalog = json.loads(data)
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("plugins"), list):
+      raise ValueError("the catalog has no plugin list")
+    verified = {}
+    for entry in catalog["plugins"]:
+      if (isinstance(entry, dict) and isinstance(entry.get("id"), str)
+          and entry.get("verificationStatus") == "verified"
+          and isinstance(entry.get("verificationCommit"), str)
+          and COMMIT_RE.match(entry["verificationCommit"])):
+        verified[entry["id"]] = entry["verificationCommit"]
+  except (OSError, ValueError, urllib.error.URLError) as e:
+    if age is not None and 0 <= age < MARKETPLACE_STALE_AGE and isinstance(cached.get("verified"), dict):
+      return cached["verified"]
+    out.progress("marketplace", f"Could not read the marketplace catalog, so this plugin is scanned: {clip(e, 200)}")
+    return None
+  write_json(MARKETPLACE_FILE, {"url": MARKETPLACE_URL, "fetchedAt": now_iso(), "verified": verified})
+  return verified
+
+
+def marketplace_verified(plugin_id, root, commit, out):
+  """The verified commit when the files at root are exactly the commit the
+  marketplace verified for plugin_id, else None."""
+  root = Path(root)
+  if not (root / ".git").is_dir():
+    return None
+  head = git(["rev-parse", "HEAD"], cwd=root, check=False)
+  if not COMMIT_RE.match(head) or (commit and commit != head):
+    return None
+  # Uncommitted or untracked files are not part of what was verified.
+  try:
+    if git(["-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=all",
+            "--ignored=matching"], cwd=root, timeout=120):
+      return None
+  except GuardError:
+    return None
+  verified = marketplace_catalog(out)
+  if verified and verified.get(plugin_id) == head:
+    return head
+  return None
+
+
+def verified_report(source, manifest, scan_id, commit):
+  return {
+    "scanId": scan_id,
+    "version": VERSION,
+    "scannedAt": now_iso(),
+    "source": source,
+    "commit": commit,
+    "plugin": {
+      "id": manifest.get("id"),
+      "name": clip(manifest.get("name"), 120),
+      "version": clip(manifest.get("version"), 64),
+      "author": clip(manifest.get("author"), 120),
+      "description": clip(manifest.get("description"), 500),
+      "kinds": [clip(k, 40) for k in manifest.get("kinds") or [] if isinstance(k, str)][:10],
+    },
+    "model": None,
+    "verdict": "safe",
+    "staticVerdict": None,
+    "modelVerdict": None,
+    "modelError": "",
+    "reviewParts": 0,
+    "marketplaceVerified": True,
+    "summary": ("Verified in the Omarchy Plugin Marketplace at this commit, so Plugin Guard did not scan it. "
+                "Scan it anyway with --scan-all, or scan verified plugins every time with: plugin-guard scan-all on."),
+    "purposeMatch": "",
+    "findings": [],
+    "networkDestinations": {"static": [], "model": []},
+    "files": {"total": 0, "reviewed": 0, "notReviewed": []},
+  }
+
+
 def scan_tree(root, source, model, config, out, scan_id, commit="", changed="", skip_model=False):
   out.progress("inventory", "Reading files")
   manifest = read_manifest(root)
+  if not config.get("scanAll"):
+    verified = marketplace_verified(manifest["id"], root, commit, out)
+    if verified:
+      out.progress("marketplace", f"{clip(manifest.get('name') or manifest['id'], 120)} is verified in the "
+                   "Omarchy Plugin Marketplace at this commit; skipping the scan")
+      report = verified_report(source, manifest, scan_id, commit or verified)
+      write_json(REPORTS_DIR / f"{scan_id}.json", report)
+      return report
   files, inv_findings = inventory(root)
   out.progress("static", "Running static checks")
   static_findings, destinations = static_scan(files)
@@ -1362,8 +1522,8 @@ def check_installed(plugin_id, model, config, out, skip_model=False):
   report = scan_tree(target, {"type": "installed", "pluginId": plugin_id}, model, config, out,
                      scan_id, identity["commit"], skip_model=skip_model)
   # A static-only check is never conclusive, so it does not replace the
-  # plugin's recorded result.
-  if not skip_model:
+  # plugin's recorded result. A marketplace verification is.
+  if not skip_model or report.get("marketplaceVerified"):
     record_installed(plugin_id, report, identity)
   return report
 
@@ -1434,7 +1594,7 @@ def gate(kind, args, config, out):
   # The plugin is not in place yet; the sweep records this result once the
   # installed commit matches, instead of scanning it again. A review the model
   # did not finish is left for the sweep to complete.
-  if report["modelVerdict"]:
+  if report["modelVerdict"] or report.get("marketplaceVerified"):
     pending = read_json(PENDING_FILE, {})
     pending[plugin_id] = {"scanId": report["scanId"], "commit": commit}
     write_json(PENDING_FILE, pending)
@@ -1542,6 +1702,11 @@ def sweep(config, out):
              f"{worst['title']} ({worst['file']}:{worst['line']}). Open Plugin Guard for the report.", "critical")
 
     report = quick
+    if quick.get("marketplaceVerified"):
+      record_installed(pid, quick, identity)
+      results.append({"id": pid, "verdict": "safe", "disabled": False, "scanId": quick["scanId"],
+                      "marketplaceVerified": True})
+      continue
     if model:
       report = scan_tree(target, {"type": "installed", "pluginId": pid}, model, config, out, new_scan_id(pid),
                          identity["commit"])
@@ -1633,9 +1798,12 @@ def print_report(report, file=None, verbose=False):
   print(f"Source: {t(src.get('url') or src.get('path') or src.get('pluginId'))}{commit}", file=file)
   if report.get("model"):
     print(f"Model:  {t(report['model'].get('label'))}", file=file)
-  print(f"Verdict: {paint(verdict.upper(), COLORS[verdict])}"
-        f"   (static checks: {known(report.get('staticVerdict'), VERDICTS, 'unknown')},"
-        f" model: {known(report.get('modelVerdict'), VERDICTS, 'not run')})", file=file)
+  if report.get("marketplaceVerified"):
+    print(f"Verdict: {paint(verdict.upper(), COLORS[verdict])}   (verified in the Omarchy Plugin Marketplace; not scanned)", file=file)
+  else:
+    print(f"Verdict: {paint(verdict.upper(), COLORS[verdict])}"
+          f"   (static checks: {known(report.get('staticVerdict'), VERDICTS, 'unknown')},"
+          f" model: {known(report.get('modelVerdict'), VERDICTS, 'not run')})", file=file)
   if report.get("modelError"):
     print(paint(f"Model review failed: {prose(report['modelError'])}", COLORS["caution"]), file=file)
   if report.get("summary"):
@@ -1712,6 +1880,21 @@ def cmd_set_model(args, config):
     print(json.dumps({"ok": True, "model": model["id"], "label": model["label"]}))
   else:
     print(f"Review model: {term_safe(model['label'])}")
+  return 0
+
+
+def cmd_scan_all(args, config):
+  if args.state:
+    config["scanAll"] = args.state == "on"
+    save_config(config)
+  on = bool(config.get("scanAll"))
+  if args.json:
+    print(json.dumps({"ok": True, "scanAll": on}))
+  elif on:
+    print("Scan all is on: plugins verified in the Omarchy Plugin Marketplace are scanned too.")
+  else:
+    print("Scan all is off: plugins verified in the Omarchy Plugin Marketplace at the commit "
+          "being checked are skipped.")
   return 0
 
 
@@ -1961,7 +2144,8 @@ def cmd_check(args, config):
 def cmd_status(args, config):
   rows = installed_status()
   if args.json:
-    print(json.dumps({"plugins": rows, "model": config.get("model", ""), "setupNeeded": setup_needed()}))
+    print(json.dumps({"plugins": rows, "model": config.get("model", ""), "setupNeeded": setup_needed(),
+                      "scanAll": bool(config.get("scanAll"))}))
     return 0
   for r in rows:
     label = {"unscanned": "not scanned", "changed": "changed since scan"}.get(r["state"], r["verdict"])
@@ -2019,6 +2203,7 @@ class Cancelled(Exception):
 
 
 LOCKED_COMMANDS = {"scan", "add", "install", "update", "apply-update", "check", "sweep", "gate", "self-update"}
+SCANNING_COMMANDS = {"scan", "add", "update", "check", "sweep", "gate"}
 
 
 def main(argv=None):
@@ -2042,6 +2227,14 @@ def main(argv=None):
     if model:
       p.add_argument("--model", help="review model id (see: plugin-guard models)")
       p.add_argument("--no-model", action="store_true", help="static checks only")
+      scan_all(p)
+
+  def scan_all(p):
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--scan-all", dest="scan_all", action="store_const", const=True, default=None,
+                       help="also scan plugins verified in the Omarchy Plugin Marketplace, for this run")
+    group.add_argument("--skip-verified", dest="scan_all", action="store_const", const=False,
+                       help="skip plugins verified in the marketplace for this run, even with scan-all on")
 
   p = sub.add_parser("models", help="list review models")
   p.add_argument("--json", action="store_true")
@@ -2095,11 +2288,13 @@ def main(argv=None):
 
   p = sub.add_parser("sweep", help="scan plugins installed or changed outside Plugin Guard")
   common(p, model=False)
+  scan_all(p)
   p.set_defaults(func=cmd_sweep)
 
   p = sub.add_parser("gate", help="pre-install/pre-update hook for Omarchy; exits 1 to refuse")
   p.add_argument("kind", choices=["install", "update"])
   p.add_argument("hook_args", nargs="*", help="install: <staged-dir> <url> <id>; update: <plugin-dir> <id> <from> <to>")
+  scan_all(p)
   p.set_defaults(func=cmd_gate, json=False, verbose=False)
 
   p = sub.add_parser("status", help="installed plugins and their scan results")
@@ -2121,6 +2316,11 @@ def main(argv=None):
   p.add_argument("--events", action="store_true", help=argparse.SUPPRESS)
   p.set_defaults(func=cmd_self_update)
 
+  p = sub.add_parser("scan-all", help="scan plugins verified in the marketplace too (on), or skip them (off)")
+  p.add_argument("state", nargs="?", choices=["on", "off"], help="omit to show the current setting")
+  p.add_argument("--json", action="store_true")
+  p.set_defaults(func=cmd_scan_all)
+
   p = sub.add_parser("setup-state", help="record that install.sh ran, or hide the reminder to run it")
   p.add_argument("action", choices=["done", "dismiss"])
   p.set_defaults(func=cmd_setup_state)
@@ -2138,6 +2338,16 @@ def main(argv=None):
            "unit": args.job_unit, "id": f"{int(time.time() * 1000)}-{os.getpid()}"}
   args.out = Out(getattr(args, "events", False), job)
   config = load_config()
+  if command in SCANNING_COMMANDS:
+    # --scan-all and --skip-verified override the saved setting for this run
+    # only; scanning commands never save the config.
+    flag = getattr(args, "scan_all", None)
+    if flag is not None:
+      config["scanAll"] = flag
+    if config.get("scanAll"):
+      args.out.progress("start", SCAN_ALL_NOTE + (SCAN_ALL_FLAG if flag else SCAN_ALL_SETTING))
+    else:
+      args.out.progress("start", SKIP_VERIFIED_NOTE)
   try:
     if command in LOCKED_COMMANDS:
       with guard_lock(args.out):
