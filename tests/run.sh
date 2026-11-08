@@ -176,6 +176,64 @@ terminal_check "hostile manifest in a scan report" "$guard" scan "$work/hostile-
 terminal_check "hostile model and repository fields in a saved report" "$guard" report hostile-report -v
 terminal_check "hostile text in progress and error output" "$guard" scan "$(cat "$work/hostile-path")" --no-model
 
+# --- Marketplace-verified plugins -------------------------------------------
+#
+# A plugin is skipped only at the exact commit the marketplace verified, with
+# no local changes, and --scan-all scans it anyway.
+
+verified_check() {
+  local name=$1 want=$2
+  shift 2
+  rm -f "$XDG_STATE_HOME/plugin-guard/marketplace.json"
+  local got
+  got=$("$guard" scan "$work/verified" --no-model --json "$@" 2>/dev/null |
+    python3 -I -c 'import json, sys; print(bool(json.load(sys.stdin).get("marketplaceVerified")))')
+  if [[ $got == "$want" ]]; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name (skipped: $got)"
+    failed=1
+  fi
+}
+
+cp -r "$here/fixtures/clean-clock" "$work/verified"
+git -C "$work/verified" init -q
+git -C "$work/verified" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
+  commit -q --allow-empty -m init
+git -C "$work/verified" add -A
+git -C "$work/verified" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
+  commit -q -m files
+verified_id=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$work/verified/manifest.json")
+verified_head=$(git -C "$work/verified" rev-parse HEAD)
+export PLUGIN_GUARD_CATALOG_URL="file://$work/catalog.json"
+write_catalog() {
+  printf '{"plugins":[{"id":"%s","verificationStatus":"%s","verificationCommit":"%s"}]}\n' \
+    "$verified_id" "$1" "$2" >"$work/catalog.json"
+}
+
+write_catalog verified "$verified_head"
+verified_check "verified plugin at its verified commit is skipped" True
+verified_check "--scan-all scans a verified plugin" False --scan-all
+write_catalog unverified "$verified_head"
+verified_check "unverified plugin is scanned" False
+write_catalog verified "$(git -C "$work/verified" rev-parse HEAD~1)"
+verified_check "verified plugin at another commit is scanned" False
+write_catalog verified "$verified_head"
+(
+  # The saved setting, in a config of its own so a --model run's real config
+  # is untouched.
+  export XDG_CONFIG_HOME="$work/scan-all-config"
+  "$guard" scan-all on >/dev/null
+  verified_check "scan-all on scans a verified plugin" False
+  verified_check "--skip-verified overrides scan-all on" True --skip-verified
+  "$guard" scan-all off >/dev/null
+  verified_check "scan-all off skips a verified plugin" True
+  exit $failed
+) || failed=1
+echo "// local change" >>"$work/verified/BarWidget.qml"
+verified_check "verified plugin with local changes is scanned" False
+unset PLUGIN_GUARD_CATALOG_URL
+
 # Notifications and prompts use the same escaping.
 if python3 -I - "$guard" <<'EOF'
 import importlib.machinery, importlib.util, sys

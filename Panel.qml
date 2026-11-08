@@ -56,6 +56,9 @@ Panel {
   property string notice: ""
   // install.sh has not run and the reminder was not dismissed.
   property bool setupNeeded: false
+  // Scan plugins verified in the Omarchy Plugin Marketplace too. Saved in
+  // Plugin Guard's config, so the hooks and the sweep follow it as well.
+  property bool scanAll: false
   // A newer Plugin Guard upstream. It cannot scan itself, so it shows the
   // commits it would apply and updates from its own repository.
   property var selfUpdate: ({})
@@ -266,6 +269,13 @@ Panel {
     if (!modelsProc.running) modelsProc.running = true
   }
 
+  function setScanAll(on) {
+    if (setScanAllProc.running) return
+    scanAll = on
+    setScanAllProc.command = ["python3", "-I", guardScript, "scan-all", on ? "on" : "off", "--json"]
+    setScanAllProc.running = true
+  }
+
   function setModel(id) {
     if (!id || id === currentModel) return
     currentModel = id
@@ -354,6 +364,7 @@ Panel {
           var data = JSON.parse(String(text || ""))
           root.plugins = Array.isArray(data.plugins) ? data.plugins : []
           root.setupNeeded = data.setupNeeded === true
+          if (!setScanAllProc.running) root.scanAll = data.scanAll === true
         } catch (e) {}
       }
     }
@@ -391,6 +402,11 @@ Panel {
   Process {
     id: setModelProc
     onExited: root.refreshModels()
+  }
+
+  Process {
+    id: setScanAllProc
+    onExited: root.refreshStatus()
   }
 
   Process {
@@ -638,6 +654,19 @@ Panel {
               PanelSeparator { foreground: root.fg }
             }
 
+            Toggle {
+              width: parent.width
+              label: strings.t("scanAll.label")
+              description: strings.t("scanAll.description")
+              foreground: root.fg
+              fontFamily: root.fontFamily
+              checked: root.scanAll
+              enabled: !root.busy
+              onClicked: root.setScanAll(!root.scanAll)
+            }
+
+            PanelSeparator { foreground: root.fg }
+
             Caption { text: strings.t("check.heading").toUpperCase() }
 
             Item {
@@ -836,7 +865,8 @@ Panel {
               textFormat: Text.PlainText
               width: parent.width
               wrapMode: Text.Wrap
-              text: (reportView.r.model ? strings.t("report.model").arg(reportView.r.model.label) + "  ·  " : "")
+              text: reportView.r.marketplaceVerified ? strings.t("report.marketplaceVerified")
+                : (reportView.r.model ? strings.t("report.model").arg(reportView.r.model.label) + "  ·  " : "")
                 + strings.t("report.static").arg(strings.t("verdict." + (reportView.r.staticVerdict || "safe")))
                   .arg(reportView.r.modelVerdict ? strings.t("verdict." + reportView.r.modelVerdict) : strings.t("report.notRun"))
               color: root.dim
