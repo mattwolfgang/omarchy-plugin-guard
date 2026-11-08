@@ -251,4 +251,21 @@ else
   failed=1
 fi
 
+# The marketplace rejects a manifest whose fields exceed these lengths
+# (manifestFieldLimits in its scripts/build-catalog.mjs).
+if python3 -I - "$here/../manifest.json" <<'EOF'
+import json, sys
+m = json.load(open(sys.argv[1]))
+limits = {"id": 128, "name": 120, "version": 64, "author": 120, "description": 500, "license": 120}
+over = {k: len(m.get(k, "")) for k, n in limits.items() if len(m.get(k, "")) > n}
+if over: print("  over the limit:", over)
+sys.exit(1 if over else 0)
+EOF
+then
+  echo "ok   manifest fields fit the marketplace limits"
+else
+  echo "FAIL manifest fields fit the marketplace limits"
+  failed=1
+fi
+
 exit $failed

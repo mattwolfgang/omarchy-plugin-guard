@@ -5,7 +5,7 @@
   "version": "1.0.7",
   "author": "Matt Wolfgang",
   "license": "MIT",
-  "description": "Security-check Omarchy plugins before installing or updating them, with static checks plus a review by a local model or the Claude, Codex, or Grok CLI. Plugins verified in the Omarchy Plugin Marketplace are skipped at the commit the marketplace verified; turn on Scan verified plugins too in the widget (or run plugin-guard scan-all on) to scan them as well. After installing, press Run setup in the widget (or run its install.sh) once for full functionality: the plugin-guard command, and checks on typed omarchy plugin add and update before they install. Versions before 1.0.3 could install a plugin but leave it disabled; enable it with omarchy plugin enable.",
+  "description": "Security-check Omarchy plugins before installing or updating them, with static checks plus a review by a local model or the Claude, Codex, or Grok CLI. A screening tool, not a guarantee that a plugin is safe. Skips plugins verified in the marketplace unless Scan verified plugins too is on. After installing, press Run setup in the widget once for the plugin-guard command and checks on typed omarchy plugin add and update. Before 1.0.3 a plugin could be left disabled; run omarchy plugin enable.",
   "kinds": [
     "bar-widget"
   ],
