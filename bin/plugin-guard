@@ -62,7 +62,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.9"
+VERSION = "1.0.10"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -1080,8 +1080,8 @@ def parse_json_reply(text):
   return json.loads(text[start:end + 1])
 
 
-def run_cli(cmd, prompt, timeout, cwd):
-  r = run_bounded(cmd, timeout, cwd=cwd, env=dict(os.environ, NO_COLOR="1"), input=prompt)
+def run_cli(cmd, prompt, timeout, cwd, env=None):
+  r = run_bounded(cmd, timeout, cwd=cwd, env=dict(os.environ, NO_COLOR="1", **(env or {})), input=prompt)
   if r.returncode != 0:
     raise GuardError(f"{cmd[0]} exited with {r.returncode}: {clip((r.stderr or r.stdout).strip(), 600)}")
   return r.stdout
@@ -1116,12 +1116,76 @@ def review_local(model, prompt, timeout):
   return parse_json_reply((choice.get("message") or {}).get("content"))
 
 
-def review_claude(model, prompt, timeout, cwd):
+# How each agent CLI is isolated during a review. The model gets the prompt
+# and must answer with JSON; it gets no tools, and none of the integrations
+# the user set up for their own work with that CLI: no MCP servers, plugins,
+# connectors, hooks, skills from other tools, memory, subagents or web
+# access. The CLI runs in an empty temporary directory, so no project files
+# or instructions apply either. Only the user's sign-in is used. A CLI too old
+# to accept these options fails the review rather than running without them.
+
+def claude_command(model):
   cmd = ["claude", "-p", "--tools", "", "--safe-mode", "--strict-mcp-config", "--no-session-persistence",
          "--output-format", "json", "--json-schema", json.dumps(REVIEW_SCHEMA)]
   if model.get("model"):
     cmd += ["--model", model["model"]]
-  out = json.loads(run_cli(cmd, prompt, timeout, cwd))
+  return cmd, {}
+
+
+# Codex features that reach outside the review, or give the model tools.
+# Set through -c so a name a given Codex version lacks is ignored, not fatal.
+CODEX_DISABLED_FEATURES = (
+  "hooks", "plugins", "remote_plugin", "apps", "browser_use", "browser_use_external", "computer_use",
+  "in_app_browser", "image_generation", "multi_agent", "multi_agent_v2", "memories", "tool_suggest",
+  "skill_mcp_dependency_install", "shell_tool", "unified_exec",
+)
+
+
+def codex_command(model, schema_file, out_file):
+  # --ignore-user-config skips $CODEX_HOME/config.toml, which holds the
+  # user's MCP servers, plugins and hook trust; sign-in still comes from
+  # CODEX_HOME. --ignore-rules skips their execpolicy rules.
+  cmd = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral",
+         "--ignore-user-config", "--ignore-rules", "-c", "mcp_servers={}", "-c", 'web_search="disabled"']
+  for feature in CODEX_DISABLED_FEATURES:
+    cmd += ["-c", f"features.{feature}=false"]
+  cmd += ["--output-schema", str(schema_file), "-o", str(out_file)]
+  if model.get("model"):
+    cmd += ["-m", model["model"]]
+  return cmd + ["-"], {}
+
+
+# Grok treats an empty --tools list as no filter at all, and keeps its MCP
+# tools (search_tool, use_tool) under any allowlist. So one harmless tool is
+# allowed and then removed with everything else, which leaves none; MCP calls
+# are denied as well. The environment turns off what Grok would otherwise load
+# from Claude's and Cursor's configuration (MCP servers, hooks, skills, rules,
+# instruction files), managed MCP servers, memory, subagents, and web and X
+# search.
+GROK_ENV = {
+  **{f"GROK_{vendor}_{kind}_ENABLED": "false"
+     for vendor in ("CLAUDE", "CURSOR") for kind in ("MCPS", "HOOKS", "SKILLS", "RULES", "AGENTS")},
+  "GROK_MANAGED_MCPS_ENABLED": "false",
+  "GROK_MEMORY": "0",
+  "GROK_SUBAGENTS": "0",
+  "GROK_WEB_FETCH": "0",
+  "GROK_BACKEND_SEARCH": "0",
+}
+
+
+def grok_command(model, prompt_file):
+  cmd = ["grok", "--prompt-file", str(prompt_file), "--tools", "todo_write",
+         "--disallowed-tools", "todo_write,search_tool,use_tool,Agent", "--deny", "MCPTool", "--no-subagents",
+         "--disable-web-search", "--permission-mode", "plan",
+         "--output-format", "json", "--json-schema", json.dumps(REVIEW_SCHEMA)]
+  if model.get("model"):
+    cmd += ["-m", model["model"]]
+  return cmd, dict(GROK_ENV)
+
+
+def review_claude(model, prompt, timeout, cwd):
+  cmd, env = claude_command(model)
+  out = json.loads(run_cli(cmd, prompt, timeout, cwd, env))
   if out.get("is_error"):
     raise GuardError("claude: " + clip(out.get("result"), 400))
   return out.get("structured_output") or parse_json_reply(out.get("result"))
@@ -1131,22 +1195,16 @@ def review_codex(model, prompt, timeout, cwd):
   schema_file = Path(cwd) / "schema.json"
   out_file = Path(cwd) / "reply.json"
   schema_file.write_text(json.dumps(REVIEW_SCHEMA))
-  cmd = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral",
-         "--output-schema", str(schema_file), "-o", str(out_file)]
-  if model.get("model"):
-    cmd += ["-m", model["model"]]
-  run_cli(cmd + ["-"], prompt, timeout, cwd)
+  cmd, env = codex_command(model, schema_file, out_file)
+  run_cli(cmd, prompt, timeout, cwd, env)
   return parse_json_reply(read_bounded(out_file, OUTPUT_LIMIT).decode("utf-8", "replace"))
 
 
 def review_grok(model, prompt, timeout, cwd):
   prompt_file = Path(cwd) / "prompt.txt"
   prompt_file.write_text(prompt)
-  cmd = ["grok", "--prompt-file", str(prompt_file), "--tools", "", "--disable-web-search",
-         "--permission-mode", "plan", "--output-format", "json", "--json-schema", json.dumps(REVIEW_SCHEMA)]
-  if model.get("model"):
-    cmd += ["-m", model["model"]]
-  out = json.loads(run_cli(cmd, "", timeout, cwd))
+  cmd, env = grok_command(model, prompt_file)
+  out = json.loads(run_cli(cmd, "", timeout, cwd, env))
   return out.get("structuredOutput") or parse_json_reply(out.get("text"))
 
 
