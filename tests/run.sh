@@ -251,6 +251,66 @@ else
   failed=1
 fi
 
+# --- Install from a separate checkout -----------------------------------------
+#
+# install.sh copies the plugin into ~/.config/omarchy/plugins when it runs from
+# a checkout elsewhere. The copy must hold every file the plugin runs, and
+# every QML component its files use, on a fresh install and on a rerun.
+# omarchy and omarchy-shell are stand-ins; HOME is a scratch directory.
+
+install_check() {
+  local name=$1
+  local fake="$work/install-bin" home="$work/install-home"
+  local dest="$home/.config/omarchy/plugins/io.github.mattwolfgang.plugin-guard"
+  mkdir -p "$fake" "$home"
+  cat >"$fake/omarchy" <<'EOF'
+#!/bin/bash
+case "$1 $2" in
+  "plugin list") echo '[{"id": "io.github.mattwolfgang.plugin-guard", "enabled": true}]' ;;
+esac
+exit 0
+EOF
+  printf '#!/bin/bash\nexit 0\n' >"$fake/omarchy-shell"
+  chmod +x "$fake/omarchy" "$fake/omarchy-shell"
+  if ! HOME="$home" PATH="$fake:/usr/bin:/bin" "$here/../install.sh" --no-bashrc --no-hooks \
+      </dev/null >"$work/install.log" 2>&1; then
+    echo "FAIL $name"
+    sed 's/^/  /' "$work/install.log"
+    failed=1
+    return
+  fi
+  if python3 -I - "$here/.." "$dest" <<'EOF'
+import re, subprocess, sys
+from pathlib import Path
+src, dest = Path(sys.argv[1]), Path(sys.argv[2])
+tracked = subprocess.run(["git", "-C", str(src), "ls-files"], capture_output=True, text=True, check=True).stdout.split()
+# What the plugin runs: QML, the manifest and license, and its bin, i18n,
+# shell, and hooks folders. Tests, docs, and the installer are not installed.
+runtime = [f for f in tracked
+           if re.fullmatch(r"[^/]+\.qml|manifest\.json|LICENSE|(bin|i18n|shell|hooks)/[^/]+", f)]
+missing = [f for f in runtime if not (dest / f).is_file()]
+# Any type an installed QML file uses that is defined by a QML file here.
+local_types = {p.stem for p in src.glob("*.qml")}
+for qml in dest.glob("*.qml"):
+  for used in set(re.findall(r"^\s*([A-Z]\w*)\s*\{", qml.read_text(), re.M)) & local_types:
+    if not (dest / f"{used}.qml").is_file():
+      missing.append(f"{used}.qml (used by {qml.name})")
+stale = [f for f in runtime if (dest / f).is_file() and (dest / f).read_bytes() != (src / f).read_bytes()]
+if missing: print("  missing:", sorted(set(missing)))
+if stale: print("  differs from the checkout:", stale)
+sys.exit(1 if missing or stale else 0)
+EOF
+  then
+    echo "ok   $name"
+  else
+    echo "FAIL $name"
+    failed=1
+  fi
+}
+
+install_check "install.sh from a separate checkout copies every runtime file"
+install_check "rerunning install.sh from the checkout keeps every runtime file"
+
 # Commands, network replies, saved files, and the clipboard are all read with
 # a byte cap and an absolute deadline.
 python3 -I "$here/bounds.py" "$guard" || failed=1

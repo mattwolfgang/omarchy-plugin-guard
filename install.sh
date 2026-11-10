@@ -46,7 +46,8 @@ timeout -k 5 120 omarchy plugin validate "$src"
 
 if [[ $(realpath -m "$src") != $(realpath -m "$dest") ]]; then
   mkdir -p "$dest/bin" "$dest/i18n" "$dest/shell" "$dest/hooks"
-  cp "$src/manifest.json" "$src/BarWidget.qml" "$src/Panel.qml" "$src/LICENSE" "$dest/"
+  # Every top-level QML file: the entry points and the components they use.
+  cp "$src/manifest.json" "$src/LICENSE" "$src"/*.qml "$dest/"
   cp "$src/bin/plugin-guard" "$dest/bin/"
   cp "$src"/i18n/*.json "$dest/i18n/"
   cp "$src/shell/omarchy-plugin-guard.bash" "$dest/shell/"
