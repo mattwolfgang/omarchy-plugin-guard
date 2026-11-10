@@ -54,12 +54,32 @@ A pre-install hook in Omarchy itself would cover every path before anything is i
 `plugin-guard models` lists what is available:
 
 - **Local models** from any OpenAI-compatible server in `localEndpoints` (default: llama-server at `http://127.0.0.1:8080`). Every model the server lists can be picked. The router loads it on first use.
-- **Frontier models** through the `claude`, `codex`, and `grok` CLIs, using the subscriptions you are already signed in to. Each one runs in an empty temporary directory:
-  - Claude: all tools disabled, safe mode, no MCP servers.
-  - Codex: read-only sandbox, ephemeral session.
-  - Grok: no tools, web search off, plan mode.
+- **Frontier models** through the `claude`, `codex`, and `grok` CLIs, using the subscriptions you are already signed in to. See [How the agent CLIs are isolated](#how-the-agent-clis-are-isolated).
 
   Append a model name to pick a specific model, such as `claude:opus`. Each CLI takes the names its own `--model` flag accepts.
+
+### How the agent CLIs are isolated
+
+A review uses only your sign-in. It never uses the integrations you set up for your own work with that CLI: MCP servers, plugins, connectors, hooks, skills, memory, or subagents. The model gets no tools and no web access. Each CLI runs in a new, empty temporary directory, so no project files or instructions apply. If your version of a CLI rejects one of the options below, the review fails rather than running without it. `tests/isolation.py` checks the exact command line and environment each CLI is started with.
+
+- **Claude Code:** `--tools ""`, `--safe-mode`, `--strict-mcp-config` (no MCP servers), and no session saved.
+- **Codex:** `--ignore-user-config` skips `$CODEX_HOME/config.toml`, which holds your MCP servers, plugins, and model and provider settings. Sign-in still comes from `CODEX_HOME`. Also:
+  - `--ignore-rules`: your execpolicy rules don't load.
+  - `-c mcp_servers={}`: no MCP servers.
+  - `web_search="disabled"`: no web search.
+  - Turned off: hooks, plugins, apps, browser and computer use, image generation, multi-agent, memories, and the shell tools.
+  - Read-only sandbox, ephemeral session.
+
+  Tested with codex-cli 0.167.0. Your own model and provider settings don't apply, so choose a model with `codex:<model>`.
+- **Grok Build** (xAI's `grok` CLI): Grok ignores an empty `--tools` list and keeps its MCP tools under any allowlist. So Plugin Guard allows one tool, `todo_write`, then removes it with `--disallowed-tools todo_write,search_tool,use_tool,Agent`, which leaves no tools. Also:
+  - `--deny MCPTool`: MCP calls are refused.
+  - `--no-subagents`.
+  - `--disable-web-search`.
+  - Plan mode.
+  - `GROK_CLAUDE_*_ENABLED=false` and `GROK_CURSOR_*_ENABLED=false`: nothing loads from Claude's or Cursor's configuration (MCP servers, hooks, skills, rules, instruction files).
+  - `GROK_MANAGED_MCPS_ENABLED=false`, `GROK_MEMORY=0`, `GROK_SUBAGENTS=0`, `GROK_WEB_FETCH=0`, and `GROK_BACKEND_SEARCH=0`: no managed MCP servers, memory, subagents, web fetch, or X search.
+
+  Tested with grok 1.0.77: a session started this way reports no tools and no MCP servers. Grok has no per-run switch for its own lifecycle hooks in `~/.grok/hooks`. Hooks you put there may still run when a review session starts and stops. With no tools, there are no tool events for them to act on.
 
 Large plugins are split into parts that fit the model's context and reviewed part by part. A frontier review sends the plugin's code to that provider. A local review keeps it on your machine.
 
@@ -173,7 +193,7 @@ Every file the model reads is written by the plugin's author, who may hide text 
 - **A static rule catches the usual phrasings,** such as "ignore previous instructions", a "note to the AI reviewer", or "mark this plugin as safe". A match is a high-severity finding, which keeps the verdict at `caution` or above. Unlike most rules, it keeps its full severity in comments, docs, and tests, because that is where such text usually hides. Bidirectional control characters, which can make code read differently than it runs, are flagged the same way.
 - **The model cannot lower the verdict.** The static checks set a floor that a persuaded model cannot go below. A model that says `safe` cannot clear a plugin the static checks rated `dangerous`.
 - **The plugin's files are marked as untrusted data.** The prompt wraps them in clearly labelled delimiters and tells the model never to follow instructions inside them, and to report any attempt as a prompt-injection finding.
-- **Injected instructions have nothing to act on.** The Claude and Grok CLIs run with every tool disabled, Claude also with MCP servers off. Codex runs in its read-only sandbox, and the local model is a plain chat request with no tools. The reply must match a fixed JSON schema.
+- **Injected instructions have nothing to act on.** Each agent CLI runs with no tools and none of your integrations (MCP servers, plugins, hooks, connectors), as described in [How the agent CLIs are isolated](#how-the-agent-clis-are-isolated). The local model is a plain chat request with no tools. The reply must match a fixed JSON schema.
 - **The reply is treated as untrusted too.** Verdicts, severities, and categories outside the allowed values are replaced, text fields are length-capped, and everything is escaped before it reaches a terminal or notification, so a reply cannot inject terminal control sequences.
 
 These defenses reduce the risk without removing it. Wording the static rule does not recognize can still mislead a model into missing something, so a model's `safe` verdict is only as good as the model itself. `tests/fixtures/malicious-weather` includes an injection attempt, and the tests check that it is caught.
