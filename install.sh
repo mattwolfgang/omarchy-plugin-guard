@@ -42,7 +42,7 @@ consent() {
   [[ $answer == [yY] || $answer == [yY][eE][sS] ]]
 }
 
-omarchy plugin validate "$src"
+timeout -k 5 120 omarchy plugin validate "$src"
 
 if [[ $(realpath -m "$src") != $(realpath -m "$dest") ]]; then
   mkdir -p "$dest/bin" "$dest/i18n" "$dest/shell" "$dest/hooks"
@@ -80,7 +80,7 @@ fi
 # A first install is a new folder the shell may not have scanned yet. The
 # shell can be busy hot-reloading the files just copied, so retry briefly.
 for _ in 1 2 3 4 5; do
-  omarchy-shell shell rescanPlugins >/dev/null 2>&1 && break
+  timeout -k 2 10 omarchy-shell shell rescanPlugins >/dev/null 2>&1 && break
   sleep 1
 done
 
@@ -88,7 +88,7 @@ done
 # shell does not know yet fails, so wait (up to 10 s) for it to be listed.
 state=unknown
 for _ in {1..40}; do
-  state="$(omarchy plugin list --json 2>/dev/null | python3 -I -c '
+  state="$(timeout -k 2 10 omarchy plugin list --json 2>/dev/null | head -c 4194304 | python3 -I -c '
 import json, sys
 p = next((p for p in json.load(sys.stdin) if p.get("id") == sys.argv[1]), None)
 print("unknown" if p is None else "enabled" if p.get("enabled") else "disabled")
@@ -98,7 +98,7 @@ print("unknown" if p is None else "enabled" if p.get("enabled") else "disabled")
 done
 
 if [[ $state != enabled ]]; then
-  omarchy plugin enable "$id" --section "$section"
+  timeout -k 5 60 omarchy plugin enable "$id" --section "$section"
 fi
 
 # The widget reminds the user to run this script until it has run.

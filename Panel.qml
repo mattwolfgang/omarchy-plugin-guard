@@ -103,7 +103,7 @@ Panel {
 
   // Fetches from GitHub at most every six hours; the result is cached.
   function checkSelfUpdate() {
-    if (!selfCheckProc.running) selfCheckProc.running = true
+    if (!selfCheckProc.running) selfCheckProc.start()
   }
 
   function applySelfUpdate() {
@@ -165,13 +165,24 @@ Panel {
     Quickshell.execDetached(unitCommand("plugin-guard-sweep", "sweep", "sweep", "", ["sweep"]))
   }
 
-  function readState(file) {
+  // Plugin Guard bounds what it writes and prints; these limits are the
+  // panel's own backstop, and anything larger is ignored.
+  readonly property int maxReplyChars: 16 * 1024 * 1024
+  readonly property int maxListed: 500
+
+  function parseReply(text) {
+    var t = String(text || "")
+    if (t === "" || t.length > maxReplyChars) return null
     try {
-      var data = JSON.parse(String(file.text() || ""))
-      return data && typeof data === "object" ? data : ({})
+      var data = JSON.parse(t)
+      return data && typeof data === "object" ? data : null
     } catch (e) {
-      return ({})
+      return null
     }
+  }
+
+  function readState(file) {
+    return parseReply(file.text()) || ({})
   }
 
   function syncJob() {
@@ -258,29 +269,29 @@ Panel {
   function openSavedReport(scanId) {
     if (!scanId || reportProc.running) return
     reportProc.command = ["python3", "-I", guardScript, "report", scanId, "--json"]
-    reportProc.running = true
+    reportProc.start()
   }
 
   function refreshStatus() {
-    if (!statusProc.running) statusProc.running = true
+    if (!statusProc.running) statusProc.start()
   }
 
   function refreshModels() {
-    if (!modelsProc.running) modelsProc.running = true
+    if (!modelsProc.running) modelsProc.start()
   }
 
   function setScanAll(on) {
     if (setScanAllProc.running) return
     scanAll = on
     setScanAllProc.command = ["python3", "-I", guardScript, "scan-all", on ? "on" : "off", "--json"]
-    setScanAllProc.running = true
+    setScanAllProc.start()
   }
 
   function setModel(id) {
     if (!id || id === currentModel) return
     currentModel = id
     setModelProc.command = ["python3", "-I", guardScript, "set-model", id, "--json"]
-    setModelProc.running = true
+    setModelProc.start()
   }
 
   // The unit sends notifications itself; the panel shows the result.
@@ -354,71 +365,66 @@ Panel {
     onTriggered: root.startSweep()
   }
 
-  Process {
+  // Short commands. Each has a deadline and reports once however it ends, so
+  // one that hangs or never starts cannot leave the panel waiting.
+  GuardProcess {
     id: statusProc
+    // Lists the plugins and reads each one's git state.
+    deadline: 60000
     command: ["python3", "-I", root.guardScript, "status", "--json"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try {
-          var data = JSON.parse(String(text || ""))
-          root.plugins = Array.isArray(data.plugins) ? data.plugins : []
-          root.setupNeeded = data.setupNeeded === true
-          if (!setScanAllProc.running) root.scanAll = data.scanAll === true
-        } catch (e) {}
+    onFinished: function(ok, text) {
+      var data = root.parseReply(text)
+      if (data) {
+        root.plugins = Array.isArray(data.plugins) ? data.plugins.slice(0, root.maxListed) : []
+        root.setupNeeded = data.setupNeeded === true
+        if (!setScanAllProc.running) root.scanAll = data.scanAll === true
       }
     }
   }
 
-  Process {
+  GuardProcess {
     id: modelsProc
+    deadline: 60000
     command: ["python3", "-I", root.guardScript, "models", "--json"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try {
-          var data = JSON.parse(String(text || ""))
-          root.models = Array.isArray(data.models) ? data.models : []
-          root.currentModel = String(data.current || "")
-        } catch (e) {}
+    onFinished: function(ok, text) {
+      var data = root.parseReply(text)
+      if (data) {
+        root.models = Array.isArray(data.models) ? data.models.slice(0, root.maxListed) : []
+        root.currentModel = String(data.current || "").slice(0, 300)
       }
     }
   }
 
-  Process {
+  GuardProcess {
     id: selfCheckProc
+    // Includes a git fetch, which Plugin Guard stops after two minutes.
+    deadline: 180000
     command: ["python3", "-I", root.guardScript, "self-update", "--check", "--json", "--max-age", "21600"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try {
-          var data = JSON.parse(String(text || ""))
-          root.selfUpdate = data && data.available === true ? data : ({})
-        } catch (e) {}
-      }
+    onFinished: function(ok, text) {
+      var data = root.parseReply(text)
+      root.selfUpdate = data && data.available === true ? data : ({})
     }
   }
 
-  Process {
+  GuardProcess {
     id: setModelProc
-    onExited: root.refreshModels()
+    deadline: 30000
+    onFinished: root.refreshModels()
   }
 
-  Process {
+  // Re-reading the status also puts the switch back if the change failed.
+  GuardProcess {
     id: setScanAllProc
-    onExited: root.refreshStatus()
+    deadline: 30000
+    onFinished: root.refreshStatus()
   }
 
-  Process {
+  GuardProcess {
     id: reportProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try {
-          var data = JSON.parse(String(text || ""))
-          if (data && data.scanId) root.showReport(data)
-        } catch (e) {}
-      }
+    deadline: 30000
+    onFinished: function(ok, text) {
+      var data = root.parseReply(text)
+      if (data && data.scanId) root.showReport(data)
     }
   }
 
@@ -673,8 +679,11 @@ Panel {
               width: parent.width
               height: Math.max(urlField.implicitHeight, scanButton.implicitHeight)
 
-              TextField {
+              // Pastes through Plugin Guard with a size and time limit; see
+              // BoundedTextField.qml.
+              BoundedTextField {
                 id: urlField
+                guardScript: root.guardScript
                 anchors.left: parent.left
                 anchors.right: scanButton.left
                 anchors.rightMargin: Style.space(8)
@@ -695,6 +704,14 @@ Panel {
                 enabled: !root.busy && urlField.text.trim() !== "" && root.models.length > 0
                 onClicked: root.scanUrl()
               }
+            }
+
+            Label {
+              width: parent.width
+              visible: urlField.pasteError !== ""
+              text: urlField.pasteError
+              color: Color.urgent
+              font.pixelSize: Style.font.bodySmall
             }
 
             PanelSeparator { foreground: root.fg }

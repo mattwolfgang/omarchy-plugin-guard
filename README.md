@@ -178,6 +178,18 @@ Every file the model reads is written by the plugin's author, who may hide text 
 
 These defenses reduce the risk without removing it. Wording the static rule does not recognize can still mislead a model into missing something, so a model's `safe` verdict is only as good as the model itself. `tests/fixtures/malicious-weather` includes an injection attempt, and the tests check that it is caught.
 
+## Bounded input
+
+Plugin Guard runs inside your shell session, so nothing it reads may hang it or fill its memory. Everything it reads is limited while it is read, not afterwards:
+
+- **Commands** (`git`, `omarchy`, and the model CLIs) have an absolute deadline, and their output is capped as it arrives. Each runs in a process group of its own, which is killed on a timeout or overflow, and once the command exits, so nothing it started is left running.
+- **Network replies** (the local model server, and the marketplace catalog) have a deadline for the whole request and a byte cap, including on error responses.
+- **Saved files** (settings, reports, and state) are size-capped, and anything that is not a regular file is refused without blocking on it. Reports keep at most 300 static findings, the most severe first. The verdict still counts every one.
+- **Pasting into the widget's URL field** never uses Qt's own clipboard reader, which reads the whole clipboard first with no limit. Ctrl+V, Shift+Insert, the Paste key, the right-click menu, and middle-click paste instead run `plugin-guard paste`, which reads at most 4 KiB within two seconds. A paste whose reply comes after you typed, moved the cursor, or left the field is dropped. Text dragged onto the field is discarded unread.
+- **The widget's own commands** have deadlines too, and recover from one that fails to start.
+
+`tests/bounds.py` checks each of these with oversized, endless, and stalled input.
+
 ## Limits
 
 This is a screening tool, not a guarantee.
