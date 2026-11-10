@@ -251,6 +251,10 @@ else
   failed=1
 fi
 
+# Commands, network replies, saved files, and the clipboard are all read with
+# a byte cap and an absolute deadline.
+python3 -I "$here/bounds.py" "$guard" || failed=1
+
 # The marketplace rejects a manifest whose fields exceed these lengths
 # (manifestFieldLimits in its scripts/build-catalog.mjs).
 if python3 -I - "$here/../manifest.json" <<'EOF'

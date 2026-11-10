@@ -48,8 +48,11 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -59,7 +62,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -102,6 +105,10 @@ MAX_FILES = 4000
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_FILE_BYTES = 400 * 1024
 MAX_HITS_PER_RULE_FILE = 5
+# Caps on what a report, and so the widget, carries.
+MAX_REPORT_FINDINGS = 300
+MAX_REPORT_DESTINATIONS = 200
+MAX_PLUGINS = 500
 STAGE_MAX_AGE_DAYS = 7
 
 SEVERITIES = ["info", "low", "medium", "high", "critical"]
@@ -195,9 +202,9 @@ class Out:
 
 def notify(title, body, urgency="normal"):
   if shutil.which("notify-send"):
-    subprocess.run(["notify-send", "-a", "Plugin Guard", "-u", urgency,
-                    term_safe(title, prose=True), term_safe(body, prose=True)],
-                   capture_output=True, timeout=10)
+    with contextlib.suppress(GuardError, OSError, subprocess.TimeoutExpired):
+      run_bounded(["notify-send", "-a", "Plugin Guard", "-u", urgency,
+                   term_safe(title, prose=True), term_safe(body, prose=True)], 10, reap=False)
 
 
 class GuardBusy(GuardError):
@@ -226,12 +233,192 @@ def now_iso():
   return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
-def read_json(path, default):
+# --------------------------------------------------------------------- bounded I/O
+#
+# Everything Plugin Guard reads from a file, a server, or another program is
+# bounded while it is read, not after: a byte cap and, for anything that can
+# stall, an absolute deadline. Oversize or late input is rejected rather than
+# truncated, except stderr, which is only used for messages.
+
+# Saved state: config, reports, scan and job state, the catalog cache.
+STATE_FILE_LIMIT = 16 * 1024 * 1024
+# Output of git, omarchy, and the model CLIs.
+OUTPUT_LIMIT = 8 * 1024 * 1024
+# Error text: stderr, and the body of an HTTP error response.
+ERROR_LIMIT = 64 * 1024
+# How long to keep reading after a command exits, for output its descendants
+# still hold open.
+EXIT_GRACE_SECONDS = 2
+
+
+class OutputTooLarge(GuardError):
+  pass
+
+
+def read_bounded(path, limit=STATE_FILE_LIMIT):
+  """A regular file's bytes, at most limit of them. The open does not block
+  on a FIFO or device, and anything that is not a regular file is refused."""
+  fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
   try:
-    with open(path, encoding="utf-8") as f:
-      return json.load(f)
-  except (OSError, ValueError):
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+      raise OSError(f"{path} is not a regular file")
+    os.set_blocking(fd, True)
+    chunks, total = [], 0
+    while True:
+      chunk = os.read(fd, min(1024 * 1024, limit + 1 - total))
+      if not chunk:
+        break
+      chunks.append(chunk)
+      total += len(chunk)
+      if total > limit:
+        raise OutputTooLarge(f"{path} is larger than {limit} bytes")
+    return b"".join(chunks)
+  finally:
+    os.close(fd)
+
+
+def read_json(path, default, limit=STATE_FILE_LIMIT):
+  try:
+    return json.loads(read_bounded(path, limit))
+  except (OSError, ValueError, GuardError):
     return default
+
+
+def kill_group(proc):
+  """Kill a command started by run_bounded and everything it started."""
+  with contextlib.suppress(ProcessLookupError, PermissionError):
+    os.killpg(proc.pid, signal.SIGKILL)
+  with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+    proc.wait(timeout=5)
+
+
+def run_bounded(cmd, timeout, cwd=None, env=None, input=None, limit=OUTPUT_LIMIT, err_limit=ERROR_LIMIT,
+                reap=True):
+  """Run cmd with an absolute deadline, draining its output while it runs.
+
+  stdout past limit stops the command with OutputTooLarge, and the deadline
+  with subprocess.TimeoutExpired; stderr is kept up to err_limit and the rest
+  dropped. The command runs in a process group of its own, which is killed on
+  a deadline, overflow, or interruption, and, with reap, once the command
+  exits, so nothing it started outlives it. Commands that hand work to a
+  long-lived process (omarchy, notify-send) pass reap=False. stdin is the
+  input text, or /dev/null."""
+  deadline = time.monotonic() + timeout
+  proc = subprocess.Popen(cmd, cwd=cwd, env=env, start_new_session=True,
+                          stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  out, err = bytearray(), bytearray()
+  pending = memoryview(input.encode("utf-8")) if input is not None else None
+  sel = selectors.DefaultSelector()
+  try:
+    sel.register(proc.stdout, selectors.EVENT_READ, "out")
+    sel.register(proc.stderr, selectors.EVENT_READ, "err")
+    if pending is not None:
+      if len(pending):
+        os.set_blocking(proc.stdin.fileno(), False)
+        sel.register(proc.stdin, selectors.EVENT_WRITE, "in")
+      else:
+        proc.stdin.close()
+    exited_at = None
+    while sel.get_map():
+      now = time.monotonic()
+      if now >= deadline:
+        raise subprocess.TimeoutExpired(cmd, timeout)
+      if exited_at is None and proc.poll() is not None:
+        exited_at = now
+      if exited_at is not None and now - exited_at > EXIT_GRACE_SECONDS:
+        break
+      for key, _ in sel.select(min(deadline - now, 0.25)):
+        if key.data == "in":
+          try:
+            sent = os.write(key.fileobj.fileno(), pending[:65536])
+          except BlockingIOError:
+            sent = 0
+          except BrokenPipeError:
+            # The command stopped reading; the rest of the input is moot.
+            sent = len(pending)
+          pending = pending[sent:]
+          if not len(pending):
+            sel.unregister(key.fileobj)
+            key.fileobj.close()
+          continue
+        chunk = os.read(key.fileobj.fileno(), 65536)
+        if not chunk:
+          sel.unregister(key.fileobj)
+        elif key.data == "out":
+          out += chunk
+          if len(out) > limit:
+            raise OutputTooLarge(f"{cmd[0]} printed more than {limit} bytes")
+        else:
+          err += chunk[:max(0, err_limit - len(err))]
+    proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+  except BaseException:
+    kill_group(proc)
+    raise
+  finally:
+    sel.close()
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+      if pipe:
+        with contextlib.suppress(OSError):
+          pipe.close()
+  if reap:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+      os.killpg(proc.pid, signal.SIGKILL)
+  return subprocess.CompletedProcess(cmd, proc.returncode, out.decode("utf-8", "replace"),
+                                     err.decode("utf-8", "replace"))
+
+
+def http_read(req, timeout, limit, what):
+  """(status, body) of a request, with an absolute deadline covering name
+  lookup, connecting, and the whole body, and the body capped at limit while
+  it arrives. An HTTP error response is returned, not raised, with at most
+  ERROR_LIMIT bytes of its body. A late request raises TimeoutError and an
+  oversized body ValueError, so callers that handle network errors (OSError)
+  and bad replies (ValueError) handle these too.
+
+  The request runs in a daemon thread so that the deadline holds even where
+  urllib has no timeout of its own, such as DNS resolution."""
+  result, state = {}, {}
+
+  def work():
+    try:
+      try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+      except urllib.error.HTTPError as e:
+        resp = e
+      state["resp"] = resp
+      cap = ERROR_LIMIT if isinstance(resp, urllib.error.HTTPError) else limit
+      body = bytearray()
+      with resp:
+        while True:
+          chunk = resp.read(min(65536, cap + 1 - len(body)))
+          if not chunk:
+            break
+          body += chunk
+          if len(body) > cap:
+            if isinstance(resp, urllib.error.HTTPError):
+              del body[cap:]
+              break
+            raise ValueError(f"{what} sent more than {limit} bytes")
+      # Only HTTP has a status; a file: URL (the tests' catalog) has none.
+      result["value"] = (getattr(resp, "status", None) or getattr(resp, "code", None) or 200, bytes(body))
+    except BaseException as e:
+      result["error"] = e
+
+  thread = threading.Thread(target=work, daemon=True)
+  thread.start()
+  thread.join(timeout)
+  if thread.is_alive():
+    # Closing the response would wait for the read in progress; shutting the
+    # socket down underneath it makes that read fail at once. The base-class
+    # call skips TLS teardown, which would also wait.
+    with contextlib.suppress(Exception):
+      socket.socket.shutdown(state["resp"].fp.raw._sock, socket.SHUT_RDWR)
+    thread.join(0.25)
+    raise TimeoutError(f"{what} did not finish within {timeout} s")
+  if "error" in result:
+    raise result["error"]
+  return result["value"]
 
 
 def write_json(path, data):
@@ -335,19 +522,26 @@ def safe_input(prompt):
 
 def local_models(config):
   models = []
-  for endpoint in config.get("localEndpoints") or []:
+  endpoints = config.get("localEndpoints") or []
+  for endpoint in (endpoints if isinstance(endpoints, list) else [])[:MAX_LOCAL_ENDPOINTS]:
     base = str(endpoint).rstrip("/")
     try:
-      with urllib.request.urlopen(base + "/v1/models", timeout=3) as r:
-        data = json.load(r)
+      status_code, body = http_read(base + "/v1/models", 3, MODELS_REPLY_LIMIT, "the local model server")
+      if status_code != 200:
+        continue
+      data = json.loads(body)
     except (OSError, ValueError, urllib.error.URLError):
       continue
-    for m in data.get("data") or []:
-      model_id = str(m.get("id") or "")
+    listed = data.get("data") if isinstance(data, dict) else None
+    for m in (listed if isinstance(listed, list) else [])[:MAX_MODELS]:
+      if not isinstance(m, dict):
+        continue
+      model_id = clip(m.get("id") or "", 200)
       if not model_id:
         continue
-      status = m.get("status") or {}
-      args = status.get("args") or []
+      status = m.get("status") if isinstance(m.get("status"), dict) else {}
+      args = status.get("args") if isinstance(status.get("args"), list) else []
+      args = args[:200]
       ctx = 0
       for i, a in enumerate(args):
         if a in ("--ctx-size", "-c") and i + 1 < len(args):
@@ -362,9 +556,16 @@ def local_models(config):
         "endpoint": base,
         "model": model_id,
         "contextTokens": ctx,
-        "status": status.get("value", ""),
+        "status": clip(status.get("value", ""), 40),
       })
-  return models
+  return models[:MAX_MODELS]
+
+
+# Caps on what the local model servers list, and on the replies they send.
+MAX_LOCAL_ENDPOINTS = 8
+MAX_MODELS = 100
+MODELS_REPLY_LIMIT = 1024 * 1024
+REVIEW_REPLY_LIMIT = 8 * 1024 * 1024
 
 
 def frontier_models():
@@ -402,7 +603,7 @@ def resolve_model(config, requested):
 def check_git_url(url):
   checker = shutil.which("omarchy-git-url-check")
   if checker:
-    r = subprocess.run([checker, url], capture_output=True, text=True)
+    r = run_bounded([checker, url], 30)
     if r.returncode != 0:
       raise GuardError((r.stderr or r.stdout).strip() or f"refusing URL: {url}")
     return
@@ -417,9 +618,9 @@ def git(args, cwd=None, timeout=300, check=True):
   env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1", GIT_CONFIG_NOSYSTEM="1")
   cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.ext.allow=never",
          "-c", "protocol.fd.allow=never", "-c", "submodule.recurse=false"] + args
-  r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+  r = run_bounded(cmd, timeout, cwd=cwd, env=env)
   if check and r.returncode != 0:
-    raise GuardError(f"git {args[0]} failed: {(r.stderr or r.stdout).strip()}")
+    raise GuardError(f"git {args[0]} failed: {clip((r.stderr or r.stdout).strip(), 2000)}")
   return r.stdout.strip()
 
 
@@ -880,8 +1081,7 @@ def parse_json_reply(text):
 
 
 def run_cli(cmd, prompt, timeout, cwd):
-  r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout, cwd=cwd,
-                     env=dict(os.environ, NO_COLOR="1"))
+  r = run_bounded(cmd, timeout, cwd=cwd, env=dict(os.environ, NO_COLOR="1"), input=prompt)
   if r.returncode != 0:
     raise GuardError(f"{cmd[0]} exited with {r.returncode}: {clip((r.stderr or r.stdout).strip(), 600)}")
   return r.stdout
@@ -897,12 +1097,19 @@ def review_local(model, prompt, timeout):
   req = urllib.request.Request(model["endpoint"] + "/v1/chat/completions", json.dumps(body).encode(),
                                {"Content-Type": "application/json"})
   try:
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-      data = json.load(r)
-  except urllib.error.HTTPError as e:
-    raise GuardError(f"local model request failed: HTTP {e.code} {clip(e.read().decode('utf-8', 'replace'), 400)}")
+    status_code, body = http_read(req, timeout, REVIEW_REPLY_LIMIT, "the local model")
   except (OSError, urllib.error.URLError) as e:
     raise GuardError(f"local model request failed: {e}")
+  except ValueError as e:
+    raise GuardError(f"local model reply rejected: {e}")
+  if status_code != 200:
+    raise GuardError(f"local model request failed: HTTP {status_code} {clip(body.decode('utf-8', 'replace'), 400)}")
+  try:
+    data = json.loads(body)
+  except ValueError:
+    raise GuardError("local model reply was not JSON")
+  if not isinstance(data, dict):
+    raise GuardError("local model reply was not a JSON object")
   choice = (data.get("choices") or [{}])[0]
   if choice.get("finish_reason") == "length":
     raise GuardError("local model ran out of output tokens before finishing the review")
@@ -929,7 +1136,7 @@ def review_codex(model, prompt, timeout, cwd):
   if model.get("model"):
     cmd += ["-m", model["model"]]
   run_cli(cmd + ["-"], prompt, timeout, cwd)
-  return parse_json_reply(out_file.read_text())
+  return parse_json_reply(read_bounded(out_file, OUTPUT_LIMIT).decode("utf-8", "replace"))
 
 
 def review_grok(model, prompt, timeout, cwd):
@@ -1028,7 +1235,7 @@ def read_manifest(root):
   if path.stat().st_size > 256 * 1024:
     raise GuardError("manifest.json is unreasonably large")
   try:
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest = json.loads(read_bounded(path, 256 * 1024))
   except ValueError as e:
     raise GuardError(f"manifest.json is not valid JSON: {e}")
   if not isinstance(manifest, dict) or not isinstance(manifest.get("id"), str):
@@ -1052,6 +1259,10 @@ MARKETPLACE_MAX_AGE = 6 * 3600
 # withdraw a verification.
 MARKETPLACE_STALE_AGE = 24 * 3600
 MARKETPLACE_MAX_BYTES = 64 * 1024 * 1024
+MARKETPLACE_MAX_ENTRIES = 50000
+# The whole download, not each network read. It stays well inside the
+# pre-install hook's budget for when nobody is at a terminal.
+MARKETPLACE_TIMEOUT = 30
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 
 SKIP_VERIFIED_NOTE = ("Skipping plugins verified in the Omarchy Plugin Marketplace at the commit being checked; "
@@ -1080,21 +1291,22 @@ def marketplace_catalog(out):
   out.progress("marketplace", "Checking the Omarchy Plugin Marketplace for verified plugins")
   try:
     req = urllib.request.Request(MARKETPLACE_URL, headers={"User-Agent": f"plugin-guard/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-      data = r.read(MARKETPLACE_MAX_BYTES + 1)
-    if len(data) > MARKETPLACE_MAX_BYTES:
-      raise ValueError("the catalog is unreasonably large")
+    status_code, data = http_read(req, MARKETPLACE_TIMEOUT, MARKETPLACE_MAX_BYTES, "the marketplace catalog")
+    if status_code != 200:
+      raise ValueError(f"the marketplace answered HTTP {status_code}")
     catalog = json.loads(data)
     if not isinstance(catalog, dict) or not isinstance(catalog.get("plugins"), list):
       raise ValueError("the catalog has no plugin list")
+    if len(catalog["plugins"]) > MARKETPLACE_MAX_ENTRIES:
+      raise ValueError("the catalog lists an unreasonable number of plugins")
     verified = {}
     for entry in catalog["plugins"]:
-      if (isinstance(entry, dict) and isinstance(entry.get("id"), str)
+      if (isinstance(entry, dict) and isinstance(entry.get("id"), str) and len(entry["id"]) <= 128
           and entry.get("verificationStatus") == "verified"
           and isinstance(entry.get("verificationCommit"), str)
           and COMMIT_RE.match(entry["verificationCommit"])):
         verified[entry["id"]] = entry["verificationCommit"]
-  except (OSError, ValueError, urllib.error.URLError) as e:
+  except (OSError, ValueError, GuardError, urllib.error.URLError) as e:
     if age is not None and 0 <= age < MARKETPLACE_STALE_AGE and isinstance(cached.get("verified"), dict):
       return cached["verified"]
     out.progress("marketplace", f"Could not read the marketplace catalog, so this plugin is scanned: {clip(e, 200)}")
@@ -1173,6 +1385,10 @@ def scan_tree(root, source, model, config, out, scan_id, commit="", changed="", 
   static_findings = inv_findings + static_findings
   static_findings.sort(key=lambda f: -SEVERITIES.index(f["severity"]))
   floor = static_floor(static_findings)
+  # The floor counts every finding; the report keeps the most severe.
+  omitted = max(0, len(static_findings) - MAX_REPORT_FINDINGS)
+  static_findings = static_findings[:MAX_REPORT_FINDINGS]
+  destinations = destinations[:MAX_REPORT_DESTINATIONS]
 
   review, parts, model_error = None, 0, ""
   if not skip_model:
@@ -1216,6 +1432,7 @@ def scan_tree(root, source, model, config, out, scan_id, commit="", changed="", 
       "static": destinations,
       "model": review["networkDestinations"] if review else [],
     },
+    "findingsOmitted": omitted,
     "files": {
       "total": len(files),
       "reviewed": sum(1 for f in files if f.get("text") is not None and not f.get("lockfile")),
@@ -1253,10 +1470,17 @@ def scan_url(url, model, config, out, skip_model=False):
 # --------------------------------------------------------------------- install / update
 
 def omarchy(args, check=True, timeout=300):
-  r = subprocess.run(["omarchy"] + args, capture_output=True, text=True, timeout=timeout)
+  r = run_bounded(["omarchy"] + args, timeout, reap=False)
   if check and r.returncode != 0:
-    raise GuardError(f"omarchy {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
+    raise GuardError(f"omarchy {' '.join(args)} failed: {clip((r.stderr or r.stdout).strip(), 2000)}")
   return r.stdout.strip()
+
+
+def rescan_plugins():
+  """Ask the shell to pick up changed plugin files. A shell that does not
+  answer in time picks them up on its next rescan."""
+  with contextlib.suppress(GuardError, OSError, subprocess.TimeoutExpired):
+    run_bounded(["omarchy-shell", "shell", "rescanPlugins"], 30, reap=False)
 
 
 def wait_until_known(plugin_id, timeout=10):
@@ -1416,7 +1640,7 @@ def apply_self_update(info, out=None):
   out.progress("update", f"Updating Plugin Guard to {info.get('version') or info['incoming'][:7]}")
   git(["merge", "--ff-only", "--quiet", info["incoming"]], cwd=target)
   write_json(SELF_UPDATE_FILE, {})
-  subprocess.run(["omarchy-shell", "shell", "rescanPlugins"], capture_output=True)
+  rescan_plugins()
   return {"ok": True, "pluginId": SELF_ID, "applied": True, "version": info.get("version", ""), "commit": info["incoming"]}
 
 
@@ -1508,7 +1732,7 @@ def apply_update(scan_id, force=False, out=None):
   # the fetch; merging it, rather than pulling again, applies exactly that.
   git(["merge", "--ff-only", "--quiet", report["commit"]], cwd=target)
   record_installed(plugin_id, report)
-  subprocess.run(["omarchy-shell", "shell", "rescanPlugins"], capture_output=True)
+  rescan_plugins()
   return {"ok": True, "pluginId": plugin_id, "applied": True, "commit": report["commit"]}
 
 
@@ -1729,9 +1953,12 @@ def third_party_plugins():
     listed = json.loads(omarchy(["plugin", "list", "--json"]))
   except (GuardError, ValueError, OSError):
     listed = []
+  if not isinstance(listed, list):
+    return []
   return [p for p in listed
-          if not p.get("firstParty") and p.get("id") != SELF_ID
-          and re.match(r"^[A-Za-z0-9._-]+$", p.get("id", "")) and (PLUGINS_DIR / p["id"]).is_dir()]
+          if isinstance(p, dict) and isinstance(p.get("id"), str) and len(p["id"]) <= 128
+          and not p.get("firstParty") and p.get("id") != SELF_ID
+          and re.match(r"^[A-Za-z0-9._-]+$", p["id"]) and (PLUGINS_DIR / p["id"]).is_dir()][:MAX_PLUGINS]
 
 
 def matches(entry, identity):
@@ -1755,7 +1982,7 @@ def installed_status():
     if entry:
       state = "scanned" if matches(entry, identity) else "changed"
     rows.append({
-      "id": pid, "name": p.get("name", pid), "enabled": bool(p.get("enabled")),
+      "id": pid, "name": clip(p.get("name") or pid, 120), "enabled": bool(p.get("enabled")),
       "git": bool(head), "state": state, "commit": head,
       "verdict": entry["verdict"] if entry else "", "scanId": entry["scanId"] if entry else "",
       "scannedAt": entry["scannedAt"] if entry else "", "model": entry.get("model", "") if entry else "",
@@ -1880,6 +2107,35 @@ def cmd_set_model(args, config):
     print(json.dumps({"ok": True, "model": model["id"], "label": model["label"]}))
   else:
     print(f"Review model: {term_safe(model['label'])}")
+  return 0
+
+
+# The widget's URL field pastes through `plugin-guard paste`, never through
+# Qt's own clipboard reader, which reads the whole offer before the field
+# sees it, with no size or time limit, inside the shell.
+PASTE_LIMIT = 4096
+PASTE_TIMEOUT = 2
+CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]+")
+
+
+def read_clipboard(selection):
+  """{"ok": True, "text": ...} or {"ok": False, "error": ...}."""
+  cmd = ["wl-paste", "--no-newline", "--type", "text"] + (["--primary"] if selection == "primary" else [])
+  try:
+    r = run_bounded(cmd, PASTE_TIMEOUT, limit=PASTE_LIMIT, err_limit=1024)
+  except OutputTooLarge:
+    return {"ok": False, "error": f"The clipboard holds more than {PASTE_LIMIT} bytes, too much for a URL."}
+  except subprocess.TimeoutExpired:
+    return {"ok": False, "error": "The clipboard did not answer in time."}
+  except OSError:
+    return {"ok": False, "error": "Could not read the clipboard; wl-paste (wl-clipboard) is needed."}
+  if r.returncode != 0:
+    return {"ok": False, "error": "The clipboard has no text."}
+  return {"ok": True, "text": CONTROL_RE.sub(" ", r.stdout).strip()}
+
+
+def cmd_paste(args, config):
+  print(json.dumps(read_clipboard(args.selection)))
   return 0
 
 
@@ -2027,8 +2283,13 @@ def ask_bar_section(plugin_id):
   default = (manifest.get("barWidget") or {}).get("defaultSection") or "centerEnd"
   default = "centerEnd" if default == "center" or default not in BAR_SECTIONS else default
   if shutil.which("gum"):
-    r = subprocess.run(["gum", "choose", f"--header=Where in the bar should {plugin_id} go?",
-                        f"--selected={default}"] + BAR_SECTIONS, stdout=subprocess.PIPE, text=True)
+    # Interactive, so the deadline is generous; the reply is one short word.
+    try:
+      r = subprocess.run(["gum", "choose", f"--header=Where in the bar should {plugin_id} go?",
+                          f"--selected={default}"] + BAR_SECTIONS, stdout=subprocess.PIPE, text=True,
+                         timeout=600)
+    except subprocess.TimeoutExpired:
+      return ""
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() in BAR_SECTIONS else ""
   answer = safe_input(f"Bar section for {term_safe(plugin_id)} ({', '.join(BAR_SECTIONS)}) [{default}]: ").strip()
   return answer if answer in BAR_SECTIONS else default
@@ -2315,6 +2576,10 @@ def main(argv=None):
   p.add_argument("--json", action="store_true")
   p.add_argument("--events", action="store_true", help=argparse.SUPPRESS)
   p.set_defaults(func=cmd_self_update)
+
+  p = sub.add_parser("paste", help=argparse.SUPPRESS)
+  p.add_argument("selection", choices=["clipboard", "primary"])
+  p.set_defaults(func=cmd_paste)
 
   p = sub.add_parser("scan-all", help="scan plugins verified in the marketplace too (on), or skip them (off)")
   p.add_argument("state", nargs="?", choices=["on", "off"], help="omit to show the current setting")
