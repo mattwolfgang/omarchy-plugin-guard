@@ -36,10 +36,25 @@ import json, os, sys
 from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
+if name == "codex" and args[:2] == ["debug", "models"]:
+  if os.environ.get("FAKE_CODEX_MODELS") == "fail":
+    sys.exit(3)
+  if os.environ.get("FAKE_CODEX_MODELS") == "garbage":
+    print("not json")
+    sys.exit(0)
+  print(json.dumps({{"models": [
+    {{"slug": "a", "tool_mode": "code_mode_only", "apply_patch_tool_type": "freeform",
+      "experimental_supported_tools": ["clock"], "multi_agent_version": "v2", "context_window": 1}},
+    {{"slug": "b", "tool_mode": None, "context_window": 2}}]}}))
+  sys.exit(0)
 prompt = sys.stdin.read()
+catalog = None
+for a in args:
+  if a.startswith("model_catalog_json="):
+    catalog = json.loads(Path(json.loads(a.split("=", 1)[1])).read_text())
 Path({str(record)!r}).write_text(json.dumps({{
   "name": name, "args": args, "cwd": os.getcwd(), "cwdFiles": sorted(os.listdir(".")),
-  "env": dict(os.environ), "prompt": prompt}}))
+  "env": dict(os.environ), "prompt": prompt, "catalog": catalog}}))
 review = {json.dumps(REVIEW)!r}
 if name == "claude":
   print(json.dumps({{"is_error": False, "structured_output": json.loads(review)}}))
@@ -115,7 +130,7 @@ def _():
   return common(run) or (None if run["prompt"] == "PROMPT" else "prompt not on stdin")
 
 
-@case("codex ignores the user's config, rules, MCP servers, hooks and plugins")
+@case("codex ignores the user's config and gets a catalog that offers no tools")
 def _():
   run = launch("codex", "gpt-5")
   args = run["args"]
@@ -125,21 +140,52 @@ def _():
   if option(args, "--sandbox") != "read-only":
     return f"sandbox {option(args, '--sandbox')!r}"
   overrides = [args[i + 1] for i, a in enumerate(args[:-1]) if a == "-c"]
-  wanted = ["mcp_servers={}", 'web_search="disabled"'] + [f"features.{f}=false" for f in (
+  wanted = ["mcp_servers={}", 'web_search="disabled"', 'approval_policy="never"', "agents.enabled=false",
+            "tools.experimental_request_user_input.enabled=false"] + [f"features.{f}=false" for f in (
     "hooks", "plugins", "remote_plugin", "apps", "browser_use", "browser_use_external", "computer_use",
-    "in_app_browser", "image_generation", "multi_agent", "memories", "shell_tool")]
+    "in_app_browser", "image_generation", "multi_agent", "multi_agent_v2", "memories", "shell_tool",
+    "unified_exec", "view_image", "goals", "sleep_tool", "code_mode", "code_mode_host", "code_mode_only")]
   missing = [w for w in wanted if w not in overrides]
   if missing:
     return f"missing overrides {missing}"
   if any(o.endswith("=true") for o in overrides):
     return "turns a feature on"
+  # The catalog Codex is given: every model, with no tool fields left.
+  catalog = run["catalog"]
+  if not catalog or [m.get("slug") for m in catalog["models"]] != ["a", "b"]:
+    return f"catalog {catalog!r}"
+  for m in catalog["models"]:
+    tools = {k: m.get(k) for k in ("tool_mode", "apply_patch_tool_type", "experimental_supported_tools",
+                                    "multi_agent_version")}
+    if tools != {"tool_mode": "direct", "apply_patch_tool_type": None, "experimental_supported_tools": [],
+                 "multi_agent_version": None}:
+      return f"model {m.get('slug')} keeps tools: {tools}"
+  if catalog["models"][0].get("context_window") != 1:
+    return "catalog lost other model fields"
   for flag in ("--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust", "--enable",
                "--profile", "-p", "--add-dir", "--oss"):
     if flag in args:
       return f"passes {flag}"
   if option(args, "-m") != "gpt-5" or args[-1] != "-":
     return "model or stdin prompt missing"
-  return common(run, {"schema.json"})
+  return common(run, {"schema.json", "models.json"})
+
+
+@case("codex reviews fail, without running codex exec, when the catalog cannot be made")
+def _():
+  for mode in ("fail", "garbage"):
+    os.environ["FAKE_CODEX_MODELS"] = mode
+    record.unlink(missing_ok=True)
+    try:
+      pg.review_batch({"id": "codex", "kind": "codex", "model": ""}, "PROMPT", 30)
+      return f"{mode}: review ran"
+    except pg.GuardError:
+      pass
+    finally:
+      del os.environ["FAKE_CODEX_MODELS"]
+    if record.exists():
+      return f"{mode}: codex exec was started"
+  return None
 
 
 @case("grok runs with no tools, MCP denied, and the user's integrations off")
