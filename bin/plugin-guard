@@ -62,7 +62,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.10"
+VERSION = "1.0.11"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -1119,8 +1119,9 @@ def review_local(model, prompt, timeout):
 # How each agent CLI is isolated during a review. The model gets the prompt
 # and must answer with JSON; it gets no tools, and none of the integrations
 # the user set up for their own work with that CLI: no MCP servers, plugins,
-# connectors, hooks, skills from other tools, memory, subagents or web
-# access. The CLI runs in an empty temporary directory, so no project files
+# connectors, skills from other tools, memory, subagents or web access, and
+# no hooks except Grok's own lifecycle hooks, which it cannot turn off per
+# run. The CLI runs in an empty temporary directory, so no project files
 # or instructions apply either. Only the user's sign-in is used. A CLI too old
 # to accept these options fails the review rather than running without them.
 
@@ -1137,16 +1138,54 @@ def claude_command(model):
 CODEX_DISABLED_FEATURES = (
   "hooks", "plugins", "remote_plugin", "apps", "browser_use", "browser_use_external", "computer_use",
   "in_app_browser", "image_generation", "multi_agent", "multi_agent_v2", "memories", "tool_suggest",
-  "skill_mcp_dependency_install", "shell_tool", "unified_exec",
+  "skill_mcp_dependency_install", "shell_tool", "unified_exec", "view_image", "goals", "sleep_tool",
+  "code_mode", "code_mode_host", "code_mode_only",
 )
 
+# Other tools come from the model's catalog entry, not from a feature: code
+# mode's exec (which also brings MCP resource tools), apply_patch, the clock,
+# and the subagent tools. A review gets a copy of the catalog with those
+# fields cleared, so the model is offered no tools at all.
+CODEX_CATALOG_NO_TOOLS = {"tool_mode": "direct", "apply_patch_tool_type": None,
+                          "experimental_supported_tools": [], "multi_agent_version": None}
+CODEX_CATALOG_TIMEOUT = 60
 
-def codex_command(model, schema_file, out_file):
+
+def codex_catalog(cwd, timeout):
+  """Write Codex's model catalog, with every model's tool fields cleared, to
+  cwd/models.json and return its path. Any problem fails the review."""
+  try:
+    r = run_bounded(["codex", "debug", "models"], min(timeout, CODEX_CATALOG_TIMEOUT), cwd=cwd,
+                    env=dict(os.environ, NO_COLOR="1"))
+  except subprocess.TimeoutExpired:
+    raise GuardError("codex did not list its models in time")
+  except OutputTooLarge:
+    raise GuardError("codex listed too much model data")
+  if r.returncode != 0:
+    raise GuardError(f"codex could not list its models: {clip((r.stderr or r.stdout).strip(), 400)}")
+  try:
+    catalog = json.loads(r.stdout)
+    models = catalog["models"]
+  except (ValueError, TypeError, KeyError):
+    raise GuardError("codex listed its models in a form Plugin Guard does not recognize")
+  if not isinstance(models, list) or not models or not all(isinstance(m, dict) for m in models):
+    raise GuardError("codex listed its models in a form Plugin Guard does not recognize")
+  for m in models:
+    m.update(CODEX_CATALOG_NO_TOOLS)
+  path = Path(cwd) / "models.json"
+  path.write_text(json.dumps(catalog))
+  return path
+
+
+def codex_command(model, schema_file, out_file, catalog_file):
   # --ignore-user-config skips $CODEX_HOME/config.toml, which holds the
   # user's MCP servers, plugins and hook trust; sign-in still comes from
   # CODEX_HOME. --ignore-rules skips their execpolicy rules.
   cmd = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral",
-         "--ignore-user-config", "--ignore-rules", "-c", "mcp_servers={}", "-c", 'web_search="disabled"']
+         "--ignore-user-config", "--ignore-rules", "-c", 'approval_policy="never"',
+         "-c", "mcp_servers={}", "-c", 'web_search="disabled"', "-c", "agents.enabled=false",
+         "-c", "tools.experimental_request_user_input.enabled=false",
+         "-c", f"model_catalog_json={json.dumps(str(catalog_file))}"]
   for feature in CODEX_DISABLED_FEATURES:
     cmd += ["-c", f"features.{feature}=false"]
   cmd += ["--output-schema", str(schema_file), "-o", str(out_file)]
@@ -1195,7 +1234,8 @@ def review_codex(model, prompt, timeout, cwd):
   schema_file = Path(cwd) / "schema.json"
   out_file = Path(cwd) / "reply.json"
   schema_file.write_text(json.dumps(REVIEW_SCHEMA))
-  cmd, env = codex_command(model, schema_file, out_file)
+  catalog_file = codex_catalog(cwd, timeout)
+  cmd, env = codex_command(model, schema_file, out_file, catalog_file)
   run_cli(cmd, prompt, timeout, cwd, env)
   return parse_json_reply(read_bounded(out_file, OUTPUT_LIMIT).decode("utf-8", "replace"))
 
