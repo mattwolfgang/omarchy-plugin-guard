@@ -158,6 +158,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
       self.wfile.write(json.dumps({"data": models}).encode())
 
 
+  def do_POST(self):
+    data = self.rfile.read(int(self.headers["Content-Length"]))
+    self.send_response(200)
+    self.end_headers()
+    self.wfile.write(self.headers["X-Test"].encode() + b":" + data)
+
+
 class Server(http.server.ThreadingHTTPServer):
   def handle_error(self, request, client_address):
     pass  # clients hang up on purpose here
@@ -194,6 +201,57 @@ def _():
     took = time.monotonic() - start
     return None if took < 3 else f"took {took:.1f} s"
   return "no TimeoutError"
+
+
+@case("a name lookup that never returns stops at the deadline, every time, leaving nothing running")
+def _():
+  # The request's child process gets a resolver that blocks forever, so it
+  # is stuck before any connection or response exists.
+  marker = "# plugin-guard-blocked-resolver-test"
+  saved = pg.HTTP_CHILD
+  pg.HTTP_CHILD = f"{marker}\nimport socket, time\nsocket.getaddrinfo = lambda *a, **k: time.sleep(3600)\n" + saved
+  threads = threading.active_count()
+  try:
+    for attempt in range(3):
+      start = time.monotonic()
+      try:
+        pg.http_read("http://plugin-guard.invalid/", 1, 1024, "test server")
+        return f"attempt {attempt + 1}: no TimeoutError"
+      except TimeoutError:
+        pass
+      took = time.monotonic() - start
+      if took > 3:
+        return f"attempt {attempt + 1} took {took:.1f} s"
+  finally:
+    pg.HTTP_CHILD = saved
+  left = []
+  for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+    with contextlib.suppress(OSError):
+      if marker.encode() in cmdline.read_bytes():
+        left.append(cmdline.parent.name)
+  if left:
+    return f"request processes still running: {left}"
+  if threading.active_count() != threads:
+    return f"{threading.active_count() - threads} threads left running"
+  return None
+
+
+@case("a request that fails reports it as a network error")
+def _():
+  try:
+    pg.http_read("http://127.0.0.1:1/", 5, 1024, "test server")
+  except ValueError as e:
+    return f"ValueError {e}"
+  except OSError:
+    return None
+  return "no error"
+
+
+@case("a request body and headers reach the server")
+def _():
+  req = pg.urllib.request.Request(serve("echo"), b"\x00body\xff", {"X-Test": "yes"})
+  status, body = pg.http_read(req, 30, 1024, "test server")
+  return None if (status, body) == (200, b"yes:\x00body\xff") else f"{status} {body!r}"
 
 
 @case("a reply past the byte cap is rejected")
