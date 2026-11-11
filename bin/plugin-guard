@@ -41,6 +41,7 @@ for NDJSON progress on stdout):
   setup-state done|dismiss   record that install.sh ran, or hide the reminder to run it
 """
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import fcntl
@@ -51,7 +52,6 @@ import re
 import selectors
 import shutil
 import signal
-import socket
 import stat
 import subprocess
 import sys
@@ -62,7 +62,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.11"
+VERSION = "1.0.12"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -293,7 +293,7 @@ def kill_group(proc):
 
 
 def run_bounded(cmd, timeout, cwd=None, env=None, input=None, limit=OUTPUT_LIMIT, err_limit=ERROR_LIMIT,
-                reap=True):
+                reap=True, binary=False):
   """Run cmd with an absolute deadline, draining its output while it runs.
 
   stdout past limit stops the command with OutputTooLarge, and the deadline
@@ -302,7 +302,7 @@ def run_bounded(cmd, timeout, cwd=None, env=None, input=None, limit=OUTPUT_LIMIT
   a deadline, overflow, or interruption, and, with reap, once the command
   exits, so nothing it started outlives it. Commands that hand work to a
   long-lived process (omarchy, notify-send) pass reap=False. stdin is the
-  input text, or /dev/null."""
+  input text, or /dev/null. With binary, stdout and stderr are bytes."""
   deadline = time.monotonic() + timeout
   proc = subprocess.Popen(cmd, cwd=cwd, env=env, start_new_session=True,
                           stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
@@ -364,8 +364,46 @@ def run_bounded(cmd, timeout, cwd=None, env=None, input=None, limit=OUTPUT_LIMIT
   if reap:
     with contextlib.suppress(ProcessLookupError, PermissionError):
       os.killpg(proc.pid, signal.SIGKILL)
+  if binary:
+    return subprocess.CompletedProcess(cmd, proc.returncode, bytes(out), bytes(err))
   return subprocess.CompletedProcess(cmd, proc.returncode, out.decode("utf-8", "replace"),
                                      err.decode("utf-8", "replace"))
+
+
+# The child process http_read runs a request in. It reads the request as JSON
+# on stdin and prints the status line, then the body, capped while it
+# arrives. A failure is one line on stderr, "<kind> <message>", and exit 3.
+HTTP_CHILD = r"""
+import base64, json, sys, urllib.error, urllib.request
+def fail(kind, message):
+  sys.stderr.write(f"{kind} {message}".replace("\n", " ")[:2000])
+  sys.exit(3)
+r = json.load(sys.stdin)
+req = urllib.request.Request(r["url"], base64.b64decode(r["data"]) if r["data"] is not None else None,
+                             r["headers"], method=r["method"])
+try:
+  try:
+    resp = urllib.request.urlopen(req, timeout=r["timeout"])
+  except urllib.error.HTTPError as e:
+    resp = e
+  cap = r["errorLimit"] if isinstance(resp, urllib.error.HTTPError) else r["limit"]
+  body = bytearray()
+  with resp:
+    while len(body) <= cap:
+      chunk = resp.read(min(65536, cap + 1 - len(body)))
+      if not chunk:
+        break
+      body += chunk
+  if len(body) > cap:
+    if not isinstance(resp, urllib.error.HTTPError):
+      fail("value", f"{r['what']} sent more than {r['limit']} bytes")
+    del body[cap:]
+except (OSError, ValueError) as e:
+  fail("value" if isinstance(e, ValueError) else "os", e)
+# Only HTTP has a status; a file: URL (the tests' catalog) has none.
+status = getattr(resp, "status", None) or getattr(resp, "code", None) or 200
+sys.stdout.buffer.write(b"%d\n" % status + body)
+"""
 
 
 def http_read(req, timeout, limit, what):
@@ -376,49 +414,32 @@ def http_read(req, timeout, limit, what):
   oversized body ValueError, so callers that handle network errors (OSError)
   and bad replies (ValueError) handle these too.
 
-  The request runs in a daemon thread so that the deadline holds even where
-  urllib has no timeout of its own, such as DNS resolution."""
-  result, state = {}, {}
-
-  def work():
-    try:
-      try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
-      except urllib.error.HTTPError as e:
-        resp = e
-      state["resp"] = resp
-      cap = ERROR_LIMIT if isinstance(resp, urllib.error.HTTPError) else limit
-      body = bytearray()
-      with resp:
-        while True:
-          chunk = resp.read(min(65536, cap + 1 - len(body)))
-          if not chunk:
-            break
-          body += chunk
-          if len(body) > cap:
-            if isinstance(resp, urllib.error.HTTPError):
-              del body[cap:]
-              break
-            raise ValueError(f"{what} sent more than {limit} bytes")
-      # Only HTTP has a status; a file: URL (the tests' catalog) has none.
-      result["value"] = (getattr(resp, "status", None) or getattr(resp, "code", None) or 200, bytes(body))
-    except BaseException as e:
-      result["error"] = e
-
-  thread = threading.Thread(target=work, daemon=True)
-  thread.start()
-  thread.join(timeout)
-  if thread.is_alive():
-    # Closing the response would wait for the read in progress; shutting the
-    # socket down underneath it makes that read fail at once. The base-class
-    # call skips TLS teardown, which would also wait.
-    with contextlib.suppress(Exception):
-      socket.socket.shutdown(state["resp"].fp.raw._sock, socket.SHUT_RDWR)
-    thread.join(0.25)
+  The request runs in a child process, started and killed like any other
+  bounded command: urllib has no timeout of its own for name lookup, and a
+  process, unlike a thread, can be stopped at the deadline wherever it is,
+  so no request outlives the call that made it."""
+  if isinstance(req, str):
+    req = urllib.request.Request(req)
+  spec = {"url": req.full_url, "method": req.get_method(), "headers": dict(req.header_items()),
+          "data": base64.b64encode(req.data).decode() if req.data is not None else None,
+          "timeout": timeout, "limit": limit, "errorLimit": ERROR_LIMIT, "what": what}
+  try:
+    r = run_bounded([sys.executable, "-I", "-c", HTTP_CHILD], timeout, input=json.dumps(spec),
+                    limit=limit + 64, binary=True)
+  except subprocess.TimeoutExpired:
     raise TimeoutError(f"{what} did not finish within {timeout} s")
-  if "error" in result:
-    raise result["error"]
-  return result["value"]
+  except OutputTooLarge:
+    raise ValueError(f"{what} sent more than {limit} bytes")
+  if r.returncode != 0:
+    kind, _, message = r.stderr.decode("utf-8", "replace").strip().rpartition("\n")[2].partition(" ")
+    if kind == "value":
+      raise ValueError(message)
+    raise OSError(message if kind == "os" else f"the request for {what} failed (exit {r.returncode})")
+  status, _, body = r.stdout.partition(b"\n")
+  try:
+    return int(status), body
+  except ValueError:
+    raise ValueError(f"no status from the request for {what}")
 
 
 def write_json(path, data):
