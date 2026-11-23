@@ -59,6 +59,7 @@ Panel {
   // Scan plugins verified in the Omarchy Plugin Marketplace too. Saved in
   // Plugin Guard's config, so the hooks and the sweep follow it as well.
   property bool scanAll: false
+  property bool skipOwn: false
   // A newer Plugin Guard upstream. It cannot scan itself, so it shows the
   // commits it would apply and updates from its own repository.
   property var selfUpdate: ({})
@@ -287,6 +288,13 @@ Panel {
     setScanAllProc.start()
   }
 
+  function setSkipOwn(on) {
+    if (setSkipOwnProc.running) return
+    skipOwn = on
+    setSkipOwnProc.command = ["python3", "-I", guardScript, "own", on ? "on" : "off", "--json"]
+    setSkipOwnProc.start()
+  }
+
   function setModel(id) {
     if (!id || id === currentModel) return
     currentModel = id
@@ -378,6 +386,7 @@ Panel {
         root.plugins = Array.isArray(data.plugins) ? data.plugins.slice(0, root.maxListed) : []
         root.setupNeeded = data.setupNeeded === true
         if (!setScanAllProc.running) root.scanAll = data.scanAll === true
+        if (!setSkipOwnProc.running) root.skipOwn = data.skipOwn === true
       }
     }
   }
@@ -416,6 +425,13 @@ Panel {
   GuardProcess {
     id: setScanAllProc
     deadline: 30000
+    onFinished: root.refreshStatus()
+  }
+
+  GuardProcess {
+    id: setSkipOwnProc
+    // Turning it on may ask gh which GitHub account is signed in.
+    deadline: 60000
     onFinished: root.refreshStatus()
   }
 
@@ -671,6 +687,17 @@ Panel {
               onClicked: root.setScanAll(!root.scanAll)
             }
 
+            Toggle {
+              width: parent.width
+              label: strings.t("skipOwn.label")
+              description: strings.t("skipOwn.description")
+              foreground: root.fg
+              fontFamily: root.fontFamily
+              checked: root.skipOwn
+              enabled: !root.busy
+              onClicked: root.setSkipOwn(!root.skipOwn)
+            }
+
             PanelSeparator { foreground: root.fg }
 
             Caption { text: strings.t("check.heading").toUpperCase() }
@@ -883,6 +910,7 @@ Panel {
               width: parent.width
               wrapMode: Text.Wrap
               text: reportView.r.marketplaceVerified ? strings.t("report.marketplaceVerified")
+                : reportView.r.ownPlugin ? strings.t("report.ownPlugin")
                 : (reportView.r.model ? strings.t("report.model").arg(reportView.r.model.label) + "  ·  " : "")
                 + strings.t("report.static").arg(strings.t("verdict." + (reportView.r.staticVerdict || "safe")))
                   .arg(reportView.r.modelVerdict ? strings.t("verdict." + reportView.r.modelVerdict) : strings.t("report.notRun"))
