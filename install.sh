@@ -8,11 +8,18 @@
 # `omarchy plugin add|update` through Plugin Guard, and, on Omarchy versions
 # that have pre-install hooks, Plugin Guard as those hooks. In a terminal it
 # asks; otherwise it makes neither change unless --bashrc or --hooks says to.
+#
+# In a terminal it also looks for local model servers (llama-server, Ollama,
+# LM Studio, vLLM) on this computer and on your other Tailscale devices, and
+# asks before adding each one it finds to Plugin Guard's settings.
+# --find-models adds every one found without asking; --no-find-models skips
+# the search. Without a terminal it does not search.
 # Re-run after editing to update the installed copy; the shell hot-reloads it.
 #
 #   ./install.sh [bar-section]            default section: right
 #   ./install.sh --bashrc --hooks         make both changes without asking
 #   ./install.sh --no-bashrc --no-hooks   make neither, without asking
+#   ./install.sh --no-find-models         do not look for local model servers
 set -euo pipefail
 
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,12 +28,15 @@ dest="$HOME/.config/omarchy/plugins/$id"
 section=right
 bashrc=ask
 hooks=ask
+models=ask
 for arg in "$@"; do
   case $arg in
     --bashrc) bashrc=yes ;;
     --no-bashrc) bashrc=no ;;
     --hooks) hooks=yes ;;
     --no-hooks) hooks=no ;;
+    --find-models) models=yes ;;
+    --no-find-models) models=no ;;
     -*) echo "install.sh: unknown option $arg" >&2; exit 1 ;;
     *) section=$arg ;;
   esac
@@ -76,6 +86,15 @@ if command -v omarchy-hook-gate >/dev/null 2>&1; then
     done
     echo "Plugin Guard is Omarchy's plugin pre-install and pre-update hook. Delete ~/.config/omarchy/hooks/plugin-pre-*.d/plugin-guard to undo it."
   fi
+fi
+
+# Local model servers: found here and on your other Tailscale devices, and
+# added only with your consent (or with --find-models).
+if [[ $models == yes ]]; then
+  timeout -k 5 120 python3 -I "$dest/bin/plugin-guard" endpoints discover --add || true
+elif [[ $models == ask && -t 0 && -t 1 ]]; then
+  # No time limit while it waits for answers; the search itself is bounded.
+  python3 -I "$dest/bin/plugin-guard" endpoints discover --ask || true
 fi
 
 # A first install is a new folder the shell may not have scanned yet. The

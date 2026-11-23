@@ -33,6 +33,7 @@ for NDJSON progress on stdout):
 
   models                     list the models available for reviews
   set-model <id>             choose the review model
+  endpoints [add|remove|discover] the local model servers to use, or find them
   scan <git-url|dir>         scan a plugin and print the report
   add <git-url>              scan, confirm, then install the scanned commit
   install <scan-id>          install the commit a previous scan checked
@@ -48,16 +49,19 @@ for NDJSON progress on stdout):
 """
 import argparse
 import base64
+import concurrent.futures
 import contextlib
 import datetime as dt
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import selectors
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -69,7 +73,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.13"
+VERSION = "1.0.14"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -396,11 +400,18 @@ def fail(kind, message):
   sys.stderr.write(f"{kind} {message}".replace("\n", " ")[:2000])
   sys.exit(3)
 r = json.load(sys.stdin)
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, *args):
+    return None
+# A direct request goes only where its URL says: no proxy from the
+# environment, and a redirect is returned as the response, not followed.
+opener = (urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect) if r["direct"]
+          else urllib.request.build_opener())
 req = urllib.request.Request(r["url"], base64.b64decode(r["data"]) if r["data"] is not None else None,
                              r["headers"], method=r["method"])
 try:
   try:
-    resp = urllib.request.urlopen(req, timeout=r["timeout"])
+    resp = opener.open(req, timeout=r["timeout"])
   except urllib.error.HTTPError as e:
     resp = e
   cap = r["errorLimit"] if isinstance(resp, urllib.error.HTTPError) else r["limit"]
@@ -423,7 +434,7 @@ sys.stdout.buffer.write(b"%d\n" % status + body)
 """
 
 
-def http_read(req, timeout, limit, what):
+def http_read(req, timeout, limit, what, direct=False):
   """(status, body) of a request, with an absolute deadline covering name
   lookup, connecting, and the whole body, and the body capped at limit while
   it arrives. An HTTP error response is returned, not raised, with at most
@@ -434,12 +445,16 @@ def http_read(req, timeout, limit, what):
   The request runs in a child process, started and killed like any other
   bounded command: urllib has no timeout of its own for name lookup, and a
   process, unlike a thread, can be stopped at the deadline wherever it is,
-  so no request outlives the call that made it."""
+  so no request outlives the call that made it.
+
+  direct=True (model servers) ignores proxy settings in the environment and
+  does not follow redirects, so the code under review reaches only the
+  server it is addressed to."""
   if isinstance(req, str):
     req = urllib.request.Request(req)
   spec = {"url": req.full_url, "method": req.get_method(), "headers": dict(req.header_items()),
           "data": base64.b64encode(req.data).decode() if req.data is not None else None,
-          "timeout": timeout, "limit": limit, "errorLimit": ERROR_LIMIT, "what": what}
+          "timeout": timeout, "limit": limit, "errorLimit": ERROR_LIMIT, "what": what, "direct": direct}
   try:
     r = run_bounded([sys.executable, "-I", "-c", HTTP_CHILD], timeout, input=json.dumps(spec),
                     limit=limit + 64, binary=True)
@@ -590,45 +605,78 @@ def safe_input(prompt):
 
 # --------------------------------------------------------------------- models
 
-def local_models(config):
+def server_models(base, timeout=3):
+  """The models an OpenAI-compatible server at base lists, or None when it
+  does not answer like one."""
+  try:
+    status_code, body = http_read(base + "/v1/models", timeout, MODELS_REPLY_LIMIT, "the local model server",
+                                    direct=True)
+    if status_code != 200:
+      return None
+    data = json.loads(body)
+  except (OSError, ValueError, RecursionError, urllib.error.URLError):
+    return None
+  listed = data.get("data") if isinstance(data, dict) else None
+  if not isinstance(listed, list):
+    return None
   models = []
-  endpoints = config.get("localEndpoints") or []
-  for endpoint in (endpoints if isinstance(endpoints, list) else [])[:MAX_LOCAL_ENDPOINTS]:
-    base = str(endpoint).rstrip("/")
-    try:
-      status_code, body = http_read(base + "/v1/models", 3, MODELS_REPLY_LIMIT, "the local model server")
-      if status_code != 200:
-        continue
-      data = json.loads(body)
-    except (OSError, ValueError, urllib.error.URLError):
+  for m in listed[:MAX_MODELS]:
+    if not isinstance(m, dict):
       continue
-    listed = data.get("data") if isinstance(data, dict) else None
-    for m in (listed if isinstance(listed, list) else [])[:MAX_MODELS]:
-      if not isinstance(m, dict):
-        continue
-      model_id = clip(m.get("id") or "", 200)
-      if not model_id:
-        continue
-      status = m.get("status") if isinstance(m.get("status"), dict) else {}
-      args = status.get("args") if isinstance(status.get("args"), list) else []
-      args = args[:200]
-      ctx = 0
-      for i, a in enumerate(args):
-        if a in ("--ctx-size", "-c") and i + 1 < len(args):
-          try:
-            ctx = int(args[i + 1])
-          except ValueError:
-            pass
-      models.append({
-        "id": "local:" + model_id,
-        "label": model_id + " (local)",
-        "kind": "local",
-        "endpoint": base,
-        "model": model_id,
-        "contextTokens": ctx,
-        "status": clip(status.get("value", ""), 40),
-      })
-  return models[:MAX_MODELS]
+    model_id = clip(m.get("id") or "", 200) if isinstance(m.get("id"), str) else ""
+    if not model_id or not printable(model_id):
+      continue
+    status = m.get("status") if isinstance(m.get("status"), dict) else {}
+    args = status.get("args") if isinstance(status.get("args"), list) else []
+    args = args[:200]
+    ctx = 0
+    for i, a in enumerate(args):
+      if a in ("--ctx-size", "-c") and i + 1 < len(args) and isinstance(args[i + 1], (str, int)):
+        try:
+          ctx = min(max(int(args[i + 1]), 0), 1 << 24)
+        except (TypeError, ValueError):
+          pass
+    models.append({
+      "id": "local:" + model_id,
+      "label": model_id + " (local)",
+      "kind": "local",
+      "endpoint": base,
+      "model": model_id,
+      "contextTokens": ctx,
+      "status": value if printable(value := clip(status.get("value", ""), 40)) else "",
+    })
+  return models
+
+
+def printable(text):
+  """False for text holding a lone surrogate, which JSON allows but nothing can print."""
+  try:
+    text.encode("utf-8")
+    return True
+  except UnicodeEncodeError:
+    return False
+
+
+def stored_endpoints(config):
+  """Every address in localEndpoints, as saved; edits change this list."""
+  endpoints = config.get("localEndpoints") or []
+  # The settings file's size cap bounds this list.
+  return [str(e).rstrip("/") for e in (endpoints if isinstance(endpoints, list) else [])]
+
+
+def configured_endpoints(config):
+  """The addresses Plugin Guard asks: the first MAX_LOCAL_ENDPOINTS."""
+  return stored_endpoints(config)[:MAX_LOCAL_ENDPOINTS]
+
+
+def local_models(config):
+  # Servers are asked at the same time, so one that is switched off or out of
+  # reach (a desktop seen from a laptop away from home) costs its timeout
+  # once, not once per server.
+  endpoints = configured_endpoints(config)
+  with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(endpoints))) as pool:
+    listed = list(pool.map(server_models, endpoints))
+  return [m for models in listed for m in (models or [])][:MAX_MODELS]
 
 
 # Caps on what the local model servers list, and on the replies they send.
@@ -636,6 +684,121 @@ MAX_LOCAL_ENDPOINTS = 8
 MAX_MODELS = 100
 MODELS_REPLY_LIMIT = 1024 * 1024
 REVIEW_REPLY_LIMIT = 8 * 1024 * 1024
+
+
+# --------------------------------------------------------------------- model servers
+#
+# `plugin-guard endpoints` lists, adds, and removes the servers in
+# localEndpoints, and `endpoints discover` looks for ones not added yet: on
+# this computer, and on your other devices when Tailscale is running. It only
+# looks at the ports model servers use by default and only on devices signed
+# in to your own Tailscale account, not devices shared with you. A server
+# counts only if it answers /v1/models with at least one model. install.sh
+# runs it and asks before adding each server it finds.
+
+MODEL_SERVER_PORTS = {8080: "llama-server", 11434: "Ollama", 1234: "LM Studio", 8000: "vLLM"}
+DISCOVER_CONNECT_TIMEOUT = 1.5
+DISCOVER_TIMEOUT = 3
+DISCOVER_WORKERS = 16
+MAX_DISCOVER_PEERS = 32
+TAILSCALE_STATUS_LIMIT = 4 * 1024 * 1024
+HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+HOSTNAME_RE = re.compile(rf"{HOST_LABEL}(?:\.{HOST_LABEL})*")
+ENDPOINT_RE = re.compile(rf"(https?)://({HOSTNAME_RE.pattern}|\[[0-9A-Fa-f:.]{{2,45}}\])(?::(\d{{1,5}}))?")
+TAILSCALE_NET = ipaddress.IPv4Network("100.64.0.0/10")
+
+
+def tailscale_ip(value):
+  try:
+    ip = ipaddress.IPv4Address(value) if isinstance(value, str) else None
+  except ValueError:
+    return None
+  return str(ip) if ip in TAILSCALE_NET else None
+
+
+def normalize_endpoint(value):
+  """A server address as http(s)://host[:port], with nothing after it."""
+  text = str(value or "").strip().rstrip("/")
+  m = ENDPOINT_RE.fullmatch(text) if len(text) <= 200 else None
+  if m and m.group(2).startswith("["):
+    try:
+      ipaddress.IPv6Address(m.group(2)[1:-1])
+    except ValueError:
+      m = None
+  if not m or (m.group(3) and not 0 < int(m.group(3)) < 65536):
+    raise GuardError("a model server address looks like http://host:port, with no path after it")
+  return text
+
+
+def port_open(host, port):
+  try:
+    with socket.create_connection((host, port), timeout=DISCOVER_CONNECT_TIMEOUT):
+      return True
+  except OSError:
+    return False
+
+
+def tailscale_devices():
+  """Your other devices on Tailscale that are online, as (name, ip, dns)."""
+  if not shutil.which("tailscale"):
+    return []
+  try:
+    r = run_bounded(["tailscale", "status", "--json"], 10, limit=TAILSCALE_STATUS_LIMIT, err_limit=4096)
+    data = json.loads(r.stdout) if r.returncode == 0 else None
+  except (subprocess.TimeoutExpired, OutputTooLarge, OSError, ValueError):
+    return []
+  if not isinstance(data, dict) or not isinstance(data.get("Self"), dict) or not isinstance(data.get("Peer"), dict):
+    return []
+  # A tagged device is owned by its tags, not by a person, and tagged devices
+  # share one user id; so a tagged computer searches only itself, and tagged
+  # devices are never counted as yours.
+  if data["Self"].get("Tags"):
+    return []
+  me = data["Self"].get("UserID")
+  tailnet = data.get("CurrentTailnet") if isinstance(data.get("CurrentTailnet"), dict) else {}
+  magic_dns = tailnet.get("MagicDNSEnabled") is True
+  devices = []
+  for peer in list(data["Peer"].values())[:1000]:
+    if not isinstance(peer, dict) or peer.get("Online") is not True or peer.get("Tags") \
+       or not isinstance(me, int) or peer.get("UserID") != me:
+      continue
+    listed = peer.get("TailscaleIPs") if isinstance(peer.get("TailscaleIPs"), list) else []
+    ips = [ip for ip in map(tailscale_ip, listed[:8]) if ip]
+    if not ips:
+      continue
+    dns = str(peer.get("DNSName") or "").rstrip(".")
+    dns = dns if magic_dns and len(dns) <= 200 and HOSTNAME_RE.fullmatch(dns) else ""
+    devices.append((clip(peer.get("HostName") or dns or ips[0], 63), ips[0], dns))
+    if len(devices) >= MAX_DISCOVER_PEERS:
+      break
+  return devices
+
+
+def discover_endpoints(config):
+  """Model servers not in localEndpoints yet: [{url, where, server, models}]."""
+  # Each host with the names it may already be listed under: its IP, its
+  # MagicDNS name, and that name's short form.
+  hosts = [("this computer", "127.0.0.1", "127.0.0.1", ("127.0.0.1", "localhost"))]
+  hosts += [(name, ip, dns or ip, (ip, dns, dns.split(".")[0]) if dns else (ip,))
+            for name, ip, dns in tailscale_devices()]
+  candidates = [(host, port) for host in hosts for port in MODEL_SERVER_PORTS]
+  known = {e.lower() for e in configured_endpoints(config)}
+
+  def probe(candidate):
+    (where, ip, address, aliases), port = candidate
+    url = f"http://{address}:{port}"
+    # Connect by IP first: no name lookup, and a closed port costs no request.
+    if any(f"{scheme}://{alias}:{port}".lower() in known for alias in aliases for scheme in ("http", "https")) \
+       or not port_open(ip, port):
+      return None
+    models = server_models(url, DISCOVER_TIMEOUT)
+    if not models:
+      return None
+    return {"url": url, "where": where, "server": MODEL_SERVER_PORTS[port],
+            "models": [m["model"] for m in models]}
+
+  with concurrent.futures.ThreadPoolExecutor(max_workers=DISCOVER_WORKERS) as pool:
+    return [found for found in pool.map(probe, candidates) if found]
 
 
 def frontier_models():
@@ -1172,7 +1335,7 @@ def review_local(model, prompt, timeout):
   req = urllib.request.Request(model["endpoint"] + "/v1/chat/completions", json.dumps(body).encode(),
                                {"Content-Type": "application/json"})
   try:
-    status_code, body = http_read(req, timeout, REVIEW_REPLY_LIMIT, "the local model")
+    status_code, body = http_read(req, timeout, REVIEW_REPLY_LIMIT, "the local model", direct=True)
   except (OSError, urllib.error.URLError) as e:
     raise GuardError(f"local model request failed: {e}")
   except ValueError as e:
@@ -2996,6 +3159,113 @@ def cmd_set_model(args, config):
   return 0
 
 
+def add_endpoints(urls):
+  """Add urls to localEndpoints under config_lock. Returns the ones added and
+  the ones left out because the list is full; one already there is neither."""
+  added, full = [], []
+
+  def change(c):
+    endpoints = stored_endpoints(c)
+    for url in urls:
+      if url in endpoints:
+        continue
+      if len(endpoints) >= MAX_LOCAL_ENDPOINTS:
+        full.append(url)
+        continue
+      endpoints.append(url)
+      added.append(url)
+    c["localEndpoints"] = endpoints
+  update_config(change)
+  return added, full
+
+
+def describe_models(models, limit=4):
+  shown = ", ".join(term_safe(m) for m in models[:limit])
+  return shown + (f" and {len(models) - limit} more" if len(models) > limit else "")
+
+
+def cmd_endpoints(args, config):
+  action = args.action or "list"
+  if action in ("add", "remove"):
+    if not args.url:
+      raise GuardError(f"endpoints {action} needs an address, such as http://my-desktop:8080")
+    # An address saved before these checks existed is removed as written.
+    raw = args.url.strip().rstrip("/")
+    url = raw if action == "remove" and raw in stored_endpoints(config) else normalize_endpoint(args.url)
+    if action == "add":
+      if add_endpoints([url])[1]:
+        raise GuardError(f"Plugin Guard uses at most {MAX_LOCAL_ENDPOINTS} model servers; remove one first")
+      models = server_models(url)
+      if args.json:
+        print(json.dumps({"ok": True, "url": url, "models": None if models is None else [m["model"] for m in models]}))
+      elif models:
+        print(f"Added {term_safe(url)}, which serves {describe_models([m['model'] for m in models])}.")
+      else:
+        print(f"Added {term_safe(url)}. It is not answering as a model server right now; "
+              "its models will appear once it does.")
+      return 0
+
+    def change(c):
+      endpoints = stored_endpoints(c)
+      if url not in endpoints:
+        raise GuardError(f"{url} is not one of the model servers Plugin Guard uses")
+      endpoints.remove(url)
+      c["localEndpoints"] = endpoints
+    update_config(change)
+    print(json.dumps({"ok": True, "url": url}) if args.json else f"Removed {term_safe(url)}.")
+    return 0
+
+  if action == "list":
+    endpoints = configured_endpoints(config)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(endpoints))) as pool:
+      listed = list(pool.map(server_models, endpoints))
+    if args.json:
+      print(json.dumps({"endpoints": [{"url": url, "models": None if models is None else [m["model"] for m in models]}
+                                      for url, models in zip(endpoints, listed)]}))
+      return 0
+    for url, models in zip(endpoints, listed):
+      state = describe_models([m["model"] for m in models]) if models else "not answering"
+      print(f"  {term_safe(url):40} {state}")
+    if not endpoints:
+      print("No model servers. Run `plugin-guard endpoints discover` to look for some.")
+    return 0
+
+  # discover
+  ask = args.ask and sys.stdin.isatty() and sys.stderr.isatty()
+  if not args.json:
+    print("Looking for model servers on this computer" +
+          (" and your other Tailscale devices" if shutil.which("tailscale") else "") + "...", file=sys.stderr)
+  found = discover_endpoints(config)
+  chosen = []
+  for server in found:
+    if not args.json:
+      print(f"Found {server['server']} on {term_safe(server['where'])} at {term_safe(server['url'])}, "
+            f"serving {describe_models(server['models'])}.")
+    if args.add:
+      chosen.append(server["url"])
+    elif ask:
+      answer = safe_input(f"Use {server['server']} on {term_safe(server['where'])} "
+                          f"({term_safe(server['url'])}) for reviews? [Y/n] ")
+      if not answer:
+        break  # end of input: add nothing more
+      if answer.strip().lower() in ("", "y", "yes"):
+        chosen.append(server["url"])
+  added, full = add_endpoints(chosen) if chosen else ([], [])
+  if args.json:
+    print(json.dumps({"found": found, "added": added}))
+    return 0
+  if not found:
+    print("No new model servers found. Add one with `plugin-guard endpoints add http://host:port`.")
+  elif added:
+    print(f"Added {len(added)} model server{'s' if len(added) != 1 else ''}. Choose a model in the "
+          "Plugin Guard panel or with `plugin-guard set-model local:<model>`.")
+  if full:
+    print(f"Plugin Guard uses at most {MAX_LOCAL_ENDPOINTS} model servers; the rest were not added.", file=sys.stderr)
+  elif found and not chosen and not ask:
+    print("Add one with `plugin-guard endpoints add <address>`, or run `plugin-guard endpoints discover --ask`.")
+  return 0
+
+
 # The widget's URL field pastes through `plugin-guard paste`, never through
 # Qt's own clipboard reader, which reads the whole offer before the field
 # sees it, with no size or time limit, inside the shell.
@@ -3493,6 +3763,15 @@ def main(argv=None):
   p.add_argument("model")
   p.add_argument("--json", action="store_true")
   p.set_defaults(func=cmd_set_model)
+
+  p = sub.add_parser("endpoints", help="list, add, remove, or discover local model servers")
+  p.add_argument("action", nargs="?", choices=["list", "add", "remove", "discover"], help="omit to list them")
+  p.add_argument("url", nargs="?", help="add/remove: a server address, such as http://my-desktop:8080")
+  group = p.add_mutually_exclusive_group()
+  group.add_argument("--ask", action="store_true", help="discover: ask before adding each server found")
+  group.add_argument("--add", action="store_true", help="discover: add every server found")
+  p.add_argument("--json", action="store_true")
+  p.set_defaults(func=cmd_endpoints)
 
   p = sub.add_parser("scan", help="scan a plugin by git URL or directory")
   p.add_argument("source")

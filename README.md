@@ -81,10 +81,28 @@ A pre-install hook in Omarchy itself would cover every path before anything is i
 
 `plugin-guard models` lists what is available:
 
-- **Local models** from any OpenAI-compatible server in `localEndpoints` (default: llama-server at `http://127.0.0.1:8080`). Every model the server lists can be picked. The router loads it on first use.
+- **Local models** from any OpenAI-compatible server in `localEndpoints` (default: llama-server at `http://127.0.0.1:8080`). Every model the server lists can be picked. The router loads it on first use. The server can be on another computer, such as a desktop with a GPU that your laptop uses. See [Local model servers](#local-model-servers).
 - **Frontier models** through the `claude`, `codex`, and `grok` CLIs, using the subscriptions you are already signed in to. See [How the agent CLIs are isolated](#how-the-agent-clis-are-isolated).
 
   Append a model name to pick a specific model, such as `claude:opus`. Each CLI takes the names its own `--model` flag accepts.
+
+### Local model servers
+
+`install.sh` looks for model servers for you and asks before adding each one it finds. `plugin-guard endpoints discover --ask` does the same at any time. It checks the ports llama-server (8080), Ollama (11434), LM Studio (1234), and vLLM (8000) use by default:
+
+- on this computer, and
+- when Tailscale is running, on your other devices that are online and signed in to your own Tailscale account. Devices shared with you by someone else are not checked.
+
+A server counts only if it answers `/v1/models` with at least one model. A server on another device is saved under its MagicDNS name, such as `http://desktop.tail1234.ts.net:8080`, or its Tailscale IP when MagicDNS is off. Tailscale encrypts the traffic between your devices. Nothing else on your network is searched. Add a server elsewhere yourself:
+
+```bash
+plugin-guard endpoints                       # the servers in use, and the models each serves
+plugin-guard endpoints add http://my-desktop:8080
+plugin-guard endpoints remove http://my-desktop:8080
+plugin-guard endpoints discover [--ask|--add]
+```
+
+The server has to accept connections from the network: llama-server, for example, listens only on `127.0.0.1` unless started with `--host`. A request to a server elsewhere carries the code being reviewed, unencrypted over `http://`, so use Tailscale or a network you trust. Plugin Guard sends no API key, so a server that requires one refuses it. If two servers offer a model with the same name, the one listed first is used. A server that is switched off or out of reach is skipped, and its models return once it answers.
 
 ### How the agent CLIs are isolated
 
@@ -149,6 +167,7 @@ Scans of a mid-size plugin take seconds with a frontier model and a few minutes 
 ```bash
 plugin-guard models                     # list review models (* marks the current one)
 plugin-guard set-model local:qwen3.8-27b
+plugin-guard endpoints discover --ask   # find local model servers here and on your Tailscale devices
 plugin-guard scan https://github.com/owner/plugin      # scan only
 plugin-guard add https://github.com/owner/plugin       # scan, ask, install
 plugin-guard add <url> --enable --section right        # ...and enable it
@@ -192,7 +211,9 @@ It links the `plugin-guard` command into `~/.local/bin`. It also offers two chan
 - **A line in `~/.bashrc`** that routes typed `omarchy plugin add|update` commands through Plugin Guard. Remove the line to undo it.
 - **On Omarchy versions with plugin pre-install hooks**, Plugin Guard registered as those hooks. Delete `~/.config/omarchy/hooks/plugin-pre-*.d/plugin-guard` to undo it.
 
-Without a terminal it makes neither change. Pass `--bashrc` or `--hooks` to make one without being asked, or `--no-bashrc` or `--no-hooks` to skip the question.
+In a terminal it also looks for local model servers on this computer and your other Tailscale devices (see [Local model servers](#local-model-servers)) and asks before adding each one. `--find-models` adds every one found without asking, and `--no-find-models` skips the search.
+
+Without a terminal it makes neither change and does not search. Pass `--bashrc` or `--hooks` to make one without being asked, or `--no-bashrc` or `--no-hooks` to skip the question.
 
 From a checkout, `./install.sh` does the same and also copies the plugin into `~/.config/omarchy/plugins` and enables it. Pass a bar section to place it somewhere else, such as `./install.sh centerEnd`.
 
@@ -245,8 +266,9 @@ These defenses reduce the risk without removing it. Wording the static rule does
 
 Plugin Guard runs inside your shell session, so nothing it reads may hang it or fill its memory. Everything it reads is limited while it is read, not afterwards:
 
-- **Commands** (`git`, `omarchy`, `gh`, and the model CLIs) have an absolute deadline, and their output is capped as it arrives. Each runs in a process group of its own, which is killed on a timeout or overflow, and once the command exits, so nothing it started is left running.
-- **Network requests** (the local model server, the marketplace catalog, and GitHub's API when you skip your own plugins) have a deadline for the whole request, name lookup and connecting included, and a byte cap on the reply, including on error responses. Each request runs in a short-lived child process that is killed at the deadline, so none outlives the call that made it.
+- **Commands** (`git`, `omarchy`, `gh`, `tailscale`, and the model CLIs) have an absolute deadline, and their output is capped as it arrives. Each runs in a process group of its own, which is killed on a timeout or overflow, and once the command exits, so nothing it started is left running.
+- **Looking for model servers** connects to each port with a 1.5-second limit, by IP address, so no name lookup is involved. It asks for the model list only where a port is open, and checks at most 32 devices. The configured servers are asked for their models at the same time, so one that is out of reach costs its timeout once.
+- **Network requests** (the local model servers, the marketplace catalog, and GitHub's API when you skip your own plugins) have a deadline for the whole request, name lookup and connecting included, and a byte cap on the reply, including on error responses. Each request runs in a short-lived child process that is killed at the deadline, so none outlives the call that made it.
 - **Saved files** (settings, reports, and state) are size-capped, and anything that is not a regular file is refused without blocking on it. Reports keep at most 300 static findings, the most severe first. The verdict still counts every one.
 - **Pasting into the widget's URL field** never uses Qt's own clipboard reader, which reads the whole clipboard first with no limit. Ctrl+V, Shift+Insert, the Paste key, the right-click menu, and middle-click paste instead run `plugin-guard paste`, which reads at most 4 KiB within two seconds. A paste whose reply comes after you typed, moved the cursor, or left the field is dropped. Text dragged onto the field is discarded unread.
 - **The widget's own commands** have deadlines too, and recover from one that fails to start.
