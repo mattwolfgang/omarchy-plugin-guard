@@ -23,6 +23,11 @@ the exact commit the marketplace verified, with no local changes.
 `scan-all on` scans them too, everywhere (hooks and the widget included);
 --scan-all and --skip-verified override that setting for one run.
 
+With `own on`, your own plugins are skipped too: ones from a GitHub account
+you name, which GitHub confirms owns the repository and has the commit in its
+default branch, and ones you build locally in a folder you trust. --scan-all
+scans them anyway.
+
 Commands (all accept --json; scan, add, install, and update accept --events
 for NDJSON progress on stdout):
 
@@ -38,6 +43,7 @@ for NDJSON progress on stdout):
   report <scan-id|plugin-id> show a saved report
   self-update [--check]      update Plugin Guard itself from its repository
   scan-all [on|off]          scan plugins verified in the marketplace too, or skip them
+  own [on|off|add-…|remove-…] skip your own plugins, and say which ones are yours
   setup-state done|dismiss   record that install.sh ran, or hide the reminder to run it
 """
 import argparse
@@ -59,10 +65,11 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 
 HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "plugin-guard"
@@ -98,6 +105,16 @@ DEFAULT_CONFIG = {
   # skipping them. Set with `plugin-guard scan-all on|off` or the widget; the
   # pre-install hooks and the background sweep follow it.
   "scanAll": False,
+  # Skip your own plugins (see "your own plugins" below). Set with
+  # `plugin-guard own`; the lists say which plugins count as yours.
+  "skipOwn": False,
+  # GitHub accounts, as {"login": ..., "id": ...}. The id is GitHub's
+  # permanent account number, so a login that changes hands does not match.
+  "trustedOwners": [],
+  # Folders that installed plugins can be symlinked from.
+  "trustedPaths": [],
+  # Ids of installed plugins that are not git clones.
+  "trustedPlugins": [],
 }
 
 # Scan limits. Files beyond them are reported as not reviewed.
@@ -467,6 +484,38 @@ def save_config(config):
   write_json(CONFIG_FILE, config)
 
 
+@contextlib.contextmanager
+def config_lock():
+  """Settings changes read, change, and save the file one at a time, so two
+  at once cannot undo each other."""
+  CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+  fd = os.open(CONFIG_DIR / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+  try:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+      raise GuardError(f"{CONFIG_DIR / '.lock'} is not a regular file")
+    deadline = time.monotonic() + 10
+    while True:
+      try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+      except BlockingIOError:
+        if time.monotonic() > deadline:
+          raise GuardError("another Plugin Guard settings change did not finish")
+        time.sleep(0.05)
+    yield
+  finally:
+    os.close(fd)
+
+
+def update_config(change):
+  """Apply change(config) to the saved settings, under config_lock."""
+  with config_lock():
+    config = load_config()
+    change(config)
+    save_config(config)
+    return config
+
+
 def clip(value, limit):
   text = str(value if value is not None else "")
   return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -635,10 +684,15 @@ def check_git_url(url):
     raise GuardError(f"'{url}' uses an unsupported transport")
 
 
-def git(args, cwd=None, timeout=300, check=True):
-  env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1", GIT_CONFIG_NOSYSTEM="1")
+def git_command(args, env=None):
+  env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1", GIT_CONFIG_NOSYSTEM="1", **(env or {}))
   cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.ext.allow=never",
          "-c", "protocol.fd.allow=never", "-c", "submodule.recurse=false"] + args
+  return cmd, env
+
+
+def git(args, cwd=None, timeout=300, check=True, env=None):
+  cmd, env = git_command(args, env)
   r = run_bounded(cmd, timeout, cwd=cwd, env=env)
   if check and r.returncode != 0:
     raise GuardError(f"git {args[0]} failed: {clip((r.stderr or r.stdout).strip(), 2000)}")
@@ -1391,11 +1445,15 @@ SCAN_ALL_FLAG = " (--scan-all)"
 SCAN_ALL_SETTING = " (scan-all is on; turn it off with: plugin-guard scan-all off)"
 
 
-def catalog_age(cached):
+def seconds_since(stamp):
   try:
-    return (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(cached["fetchedAt"])).total_seconds()
-  except (KeyError, TypeError, ValueError):
+    return (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(stamp)).total_seconds()
+  except (TypeError, ValueError):
     return None
+
+
+def catalog_age(cached):
+  return seconds_since(cached.get("fetchedAt"))
 
 
 def marketplace_catalog(out):
@@ -1434,6 +1492,277 @@ def marketplace_catalog(out):
   return verified
 
 
+# Files beyond the commit that an installed copy of your own plugin may hold:
+# small settings files a plugin saves in its own folder, which nothing runs.
+DATA_EXTENSIONS = {".json", ".toml", ".ini", ".conf", ".cfg", ".yaml", ".yml", ".txt", ".log", ".csv"}
+DATA_FILE_MAX_BYTES = 1024 * 1024
+
+
+# One budget for checking a checkout against its commit, objects and files.
+TREE_CHECK_SECONDS = 120
+MAX_DATA_FILES = 100
+
+
+def git_objects(root, shas, limit, deadline):
+  """{sha: (type, content)} of each object, read through git but checked
+  here: an object whose content does not hash to its name is refused,
+  whatever the checkout's git does. Nothing is fetched: a checkout's config
+  can name a promisor remote that git would otherwise ask for a missing
+  object."""
+  shas = list(dict.fromkeys(shas))
+  timeout = deadline - time.monotonic()
+  if timeout <= 0:
+    raise GuardError("checking the files took too long")
+  cmd, env = git_command(["-c", "protocol.allow=never", "cat-file", "--batch"], {"GIT_NO_LAZY_FETCH": "1"})
+  r = run_bounded(cmd, timeout, cwd=root, env=env, input="".join(sha + "\n" for sha in shas), limit=limit,
+                  binary=True)
+  if r.returncode != 0:
+    raise GuardError("git cat-file failed")
+  data, pos, objects = r.stdout, 0, {}
+  for sha in shas:
+    end = data.find(b"\n", pos)
+    header = data[pos:end].decode("ascii", "replace").split() if end >= 0 else []
+    if len(header) != 3 or header[0] != sha or not header[2].isdigit():
+      raise GuardError(f"object {sha[:12]} is missing")
+    kind, size = header[1], int(header[2])
+    content = data[end + 1:end + 1 + size]
+    if len(content) != size or data[end + 1 + size:end + 2 + size] != b"\n":
+      raise GuardError(f"object {sha[:12]} is cut short")
+    algo = "sha1" if len(sha) == 40 else "sha256"
+    if hashlib.new(algo, f"{kind} {size}\0".encode() + content).hexdigest() != sha:
+      raise GuardError(f"object {sha[:12]} does not match its name")
+    objects[sha] = (kind, content)
+    pos = end + 2 + size
+  return objects
+
+
+def parse_tree(content, raw_len):
+  entries, pos = [], 0
+  while pos < len(content):
+    space = content.index(b" ", pos)
+    nul = content.index(b"\0", space)
+    sha = content[nul + 1:nul + 1 + raw_len]
+    if len(sha) != raw_len:
+      raise ValueError("a tree entry is cut short")
+    entries.append((content[pos:space].decode("ascii"), content[space + 1:nul].decode("utf-8", "surrogateescape"),
+                    sha.hex()))
+    pos = nul + 1 + raw_len
+  return entries
+
+
+def commit_files(root, head, deadline):
+  """{path: (mode, blob id)} of every file in commit head, each tree checked
+  as it is read (see git_objects). None for a commit that is not plain files:
+  one with a submodule, a path named .git, or more than MAX_FILES entries
+  (files and folders together)."""
+  kind, content = git_objects(root, [head], 1024 * 1024, deadline)[head]
+  m = re.match(rb"tree ([0-9a-f]+)\n", content)
+  if kind != "commit" or not m or len(m.group(1)) != len(head):
+    raise GuardError("HEAD is not a commit")
+  files, pending, raw_len, entries = {}, [("", m.group(1).decode())], len(head) // 2, 0
+  while pending:
+    trees = git_objects(root, [sha for _, sha in pending], OUTPUT_LIMIT, deadline)
+    nested = []
+    for prefix, sha in pending:
+      kind, content = trees[sha]
+      if kind != "tree":
+        raise GuardError(f"object {sha[:12]} is not a tree")
+      for mode, name, child in parse_tree(content, raw_len):
+        if name in ("", ".", "..") or "/" in name or name.lower() == ".git":
+          return None
+        if mode == "40000":
+          nested.append((prefix + name + "/", child))
+        elif mode in ("100644", "100755", "120000"):
+          files[prefix + name] = (mode, child)
+        else:
+          return None
+        entries += 1
+        if entries > MAX_FILES:
+          return None
+    pending = nested
+  return files
+
+
+def file_blob_id(path, size, algo):
+  h = hashlib.new(algo, b"blob %d\0" % size)
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+  try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_size != size:
+      raise OSError(f"{path} changed while it was read")
+    read = 0
+    while True:
+      chunk = os.read(fd, min(1024 * 1024, size + 1 - read))
+      if not chunk:
+        break
+      read += len(chunk)
+      if read > size:
+        raise OSError(f"{path} grew while it was read")
+      h.update(chunk)
+  finally:
+    os.close(fd)
+  return h.hexdigest()
+
+
+def ignored_by_commit(root, paths, deadline):
+  """The paths, of those given, that the checkout's own .gitignore files
+  exclude. Those files are part of the commit (tree_matches checks them); git
+  reads them through an empty repository of its own, so the checkout's
+  info/exclude and config, and any global excludes file, play no part."""
+  with tempfile.TemporaryDirectory(prefix="plugin-guard-ignore-") as empty:
+    timeout = deadline - time.monotonic()
+    if timeout <= 0:
+      raise GuardError("checking the files took too long")
+    # No template: one could bring an info/exclude of its own.
+    git(["init", "--quiet", "--bare", "--template=", empty], timeout=timeout)
+    cmd, env = git_command(["-c", "core.excludesFile=/dev/null", "--git-dir", empty, "--work-tree", str(root),
+                            "check-ignore", "--no-index", "-z", "--stdin"], {"GIT_CONFIG_GLOBAL": "/dev/null"})
+    r = run_bounded(cmd, max(1, deadline - time.monotonic()), cwd=root, env=env,
+                    input="".join(path + "\0" for path in paths), binary=True)
+  if r.returncode not in (0, 1):
+    raise GuardError("git check-ignore failed")
+  return {os.fsdecode(path) for path in r.stdout.split(b"\0") if path}
+
+
+def lands_on_committed_file(root, link, committed, folders):
+  """Whether the committed symlink at path link leads, hop by hop, to a
+  regular file of the commit, never leaving it or entering .git. Each step
+  is looked up in the commit, which the files on disk were checked against,
+  so the path is followed the way the kernel follows it."""
+  pending = [link]
+  hops = 0
+  while pending:
+    current = pending.pop()
+    hops += 1
+    if hops > 40:
+      return False
+    target = os.fsdecode(os.readlink(os.fsencode(Path(root) / current)))
+    if target.startswith("/"):
+      return False
+    parts = current.split("/")[:-1] + target.split("/")
+    resolved = []
+    while parts:
+      part = parts.pop(0)
+      if part in ("", "."):
+        continue
+      if part == "..":
+        if not resolved:
+          return False
+        resolved.pop()
+        continue
+      resolved.append(part)
+      path = "/".join(resolved)
+      if path.split("/")[0].lower() == ".git":
+        return False
+      mode = committed.get(path, ("",))[0]
+      if mode == "120000":
+        # Another committed link: carry on from where it leads.
+        hops += 1
+        if hops > 40:
+          return False
+        inner = os.fsdecode(os.readlink(os.fsencode(Path(root) / path)))
+        if inner.startswith("/"):
+          return False
+        resolved.pop()
+        parts = inner.split("/") + parts
+      elif mode in ("100644", "100755"):
+        if parts and any(p not in ("", ".") for p in parts):
+          return False
+        break
+      elif path not in folders:
+        return False
+    else:
+      return False
+  return True
+
+
+def tree_matches(root, head, allow_data=False):
+  """Whether the files at root are exactly commit head: every file in it,
+  with the same contents, executable bit, and symlink target, and nothing
+  else. The files are hashed here and compared with the commit's own
+  objects, checked as they are read, so neither the checkout's index
+  (skip-worktree, assume-unchanged, stale stat data) nor its config can hide
+  a change. A symlink must lead to a regular file of the commit.
+
+  With allow_data, small settings files a plugin saves in its own folder are
+  allowed too: data files (DATA_EXTENSIONS, not executable, not a
+  manifest.json) that the commit's own .gitignore excludes."""
+  root = Path(root)
+  algo = "sha1" if len(head) == 40 else "sha256"
+  deadline = time.monotonic() + TREE_CHECK_SECONDS
+  try:
+    top = root.resolve(strict=True)
+    expected = commit_files(root, head, deadline)
+    if expected is None:
+      return False
+    committed = dict(expected)
+    total, seen, extra, links = 0, 0, [], []
+    # Read entry by entry, so a huge folder hits the limits as it is read.
+    folders = [(root, "")]
+    while folders:
+      folder, prefix = folders.pop()
+      with os.scandir(folder) as entries:
+        for item in entries:
+          seen += 1
+          if seen > 2 * MAX_FILES or time.monotonic() > deadline:
+            return False
+          if not prefix and item.name == ".git":
+            continue
+          path = prefix + item.name
+          st = item.stat(follow_symlinks=False)
+          if stat.S_ISDIR(st.st_mode):
+            folders.append((Path(item.path), path + "/"))
+            continue
+          want = expected.pop(path, None)
+          if want is None:
+            if (allow_data and stat.S_ISREG(st.st_mode) and not st.st_mode & 0o111
+                and st.st_size <= DATA_FILE_MAX_BYTES and Path(item.name).suffix.lower() in DATA_EXTENSIONS
+                and item.name.lower() != "manifest.json" and len(extra) < MAX_DATA_FILES):
+              extra.append(path)
+              continue
+            return False
+          mode, blob = want
+          if mode == "120000":
+            if not stat.S_ISLNK(st.st_mode):
+              return False
+            target = os.readlink(os.fsencode(item.path))
+            found = hashlib.new(algo, b"blob %d\0" % len(target) + target).hexdigest()
+            links.append(Path(item.path))
+          else:
+            if not stat.S_ISREG(st.st_mode) or (mode == "100755") != bool(st.st_mode & stat.S_IXUSR):
+              return False
+            total += st.st_size
+            if total > MAX_TOTAL_BYTES:
+              return False
+            found = file_blob_id(item.path, st.st_size, algo)
+          if found != blob:
+            return False
+    if expected:
+      return False
+    # Where a symlink leads is read through it, so it must be a regular file
+    # the commit holds (and so was just checked), reached only through
+    # folders and symlinks the commit holds too.
+    folders_in_commit = {"/".join(path.split("/")[:i]) for path in committed for i in range(1, path.count("/") + 1)}
+    for link in links:
+      if not lands_on_committed_file(root, link.relative_to(root).as_posix(), committed, folders_in_commit):
+        return False
+    return not extra or ignored_by_commit(root, extra, deadline) >= set(extra)
+  except (GuardError, subprocess.TimeoutExpired, OSError, RuntimeError, ValueError, UnicodeError):
+    return False
+
+
+def clean_head(root, commit="", allow_data=False):
+  """HEAD of the git checkout at root when its files are exactly that commit
+  (and it is commit, when one is given; see tree_matches), else None."""
+  root = Path(root)
+  if not (root / ".git").is_dir():
+    return None
+  head = git(["rev-parse", "HEAD"], cwd=root, check=False)
+  if not COMMIT_RE.fullmatch(head) or (commit and commit != head):
+    return None
+  return head if tree_matches(root, head, allow_data) else None
+
+
 def marketplace_verified(plugin_id, root, commit, out):
   """The verified commit when the files at root are exactly the commit the
   marketplace verified for plugin_id, else None."""
@@ -1441,22 +1770,17 @@ def marketplace_verified(plugin_id, root, commit, out):
   if not (root / ".git").is_dir():
     return None
   head = git(["rev-parse", "HEAD"], cwd=root, check=False)
-  if not COMMIT_RE.match(head) or (commit and commit != head):
-    return None
-  # Uncommitted or untracked files are not part of what was verified.
-  try:
-    if git(["-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=all",
-            "--ignored=matching"], cwd=root, timeout=120):
-      return None
-  except GuardError:
+  if not COMMIT_RE.fullmatch(head) or (commit and commit != head):
     return None
   verified = marketplace_catalog(out)
-  if verified and verified.get(plugin_id) == head:
-    return head
-  return None
+  if not verified or verified.get(plugin_id) != head:
+    return None
+  return head if tree_matches(root, head) else None
 
 
-def verified_report(source, manifest, scan_id, commit):
+def skipped_report(source, manifest, scan_id, commit, summary, marks):
+  """The report for a plugin that was not scanned: verified in the
+  marketplace (marks has marketplaceVerified) or your own (ownPlugin)."""
   return {
     "scanId": scan_id,
     "version": VERSION,
@@ -1477,14 +1801,412 @@ def verified_report(source, manifest, scan_id, commit):
     "modelVerdict": None,
     "modelError": "",
     "reviewParts": 0,
-    "marketplaceVerified": True,
-    "summary": ("Verified in the Omarchy Plugin Marketplace at this commit, so Plugin Guard did not scan it. "
-                "Scan it anyway with --scan-all, or scan verified plugins every time with: plugin-guard scan-all on."),
+    **marks,
+    "summary": summary,
     "purposeMatch": "",
     "findings": [],
     "networkDestinations": {"static": [], "model": []},
     "files": {"total": 0, "reviewed": 0, "notReviewed": []},
   }
+
+
+def not_scanned(report):
+  """Whether a report stands for a plugin that was skipped, not scanned."""
+  return bool(report.get("marketplaceVerified") or report.get("ownPlugin"))
+
+
+# --------------------------------------------------------------------- your own plugins
+#
+# With skipOwn on, plugins that are yours are not scanned:
+#
+#   - From GitHub: the source is https://github.com/<owner>/<repo> for an
+#     account in trustedOwners; GitHub says that account, matched by its
+#     permanent numeric id rather than its login, owns the repository now;
+#     and the commit is in the history of the repository's default branch.
+#     The files must be exactly that commit (see tree_matches), apart from
+#     small data files such as saved settings. So a transferred repository,
+#     a login someone else took over, a commit from a fork, and a local
+#     change are all scanned, and so is anything GitHub cannot confirm.
+#   - Built locally: an installed plugin whose folder is a symlink into one
+#     of trustedPaths, or whose folder was listed in trustedPlugins. A
+#     symlinked plugin inside a git checkout is trusted only when every
+#     remote of that checkout is a repository GitHub says one of your
+#     accounts owns; a listed one must not be a checkout with remotes, and
+#     stops being trusted when its folder is replaced.
+#
+# A skip is checked again when the setting changes and after
+# OWNERSHIP_MAX_AGE, so a plugin that stops counting as yours is scanned.
+# --scan-all scans them anyway.
+
+GITHUB_API = "https://api.github.com"
+OWNERSHIP_FILE = STATE_DIR / "ownership.json"
+# A confirmation is reused for this long; a repository can change hands.
+OWNERSHIP_MAX_AGE = 6 * 3600
+OWNERSHIP_MAX_ENTRIES = 500
+# The whole request, name lookup and connecting included.
+GITHUB_TIMEOUT = 20
+GITHUB_MAX_BYTES = 8 * 1024 * 1024
+MAX_TRUSTED = 50
+LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
+REPO_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
+PLUGIN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# Only https on github.com itself: an ssh host can be remapped in ssh config,
+# and a user, port, query, or extra path is not a plain repository URL.
+GITHUB_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})/?")
+
+SKIP_OWN_NOTE = "Skipping your own plugins; scan them too with --scan-all, or turn that off with: plugin-guard own off"
+
+
+def github_repo(url):
+  """(owner, repo) of an https://github.com/<owner>/<repo> URL, else None."""
+  m = GITHUB_URL_RE.fullmatch(url) if isinstance(url, str) else None
+  if not m:
+    return None
+  owner, repo = m.group(1), m.group(2)
+  if repo.endswith(".git"):
+    repo = repo[:-4]
+  if not repo or set(repo) == {"."}:
+    return None
+  return owner, repo
+
+
+def trusted_owners(config):
+  owners = config.get("trustedOwners")
+  return [{"login": o["login"], "id": o["id"]} for o in (owners if isinstance(owners, list) else [])
+          if isinstance(o, dict) and isinstance(o.get("login"), str) and LOGIN_RE.fullmatch(o["login"])
+          and type(o.get("id")) is int and o["id"] > 0][:MAX_TRUSTED]
+
+
+def trusted_paths(config):
+  paths = config.get("trustedPaths")
+  return [p for p in (paths if isinstance(paths, list) else [])
+          if isinstance(p, str) and p.startswith("/") and len(p) <= 4096][:MAX_TRUSTED]
+
+
+# A listed plugin's folder carries this extended attribute, set to a random
+# token saved with the listing. A folder that replaces it, even one that
+# reuses its inode, does not have the token.
+LISTED_XATTR = "user.plugin-guard.own"
+TOKEN_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def trusted_plugins(config):
+  """[{"id", "dev", "ino", "token"}]: a listed plugin, and the folder it was
+  listed with, so a folder that replaces it is not trusted."""
+  ids = config.get("trustedPlugins")
+  return [{"id": i["id"], "dev": i["dev"], "ino": i["ino"], "token": i["token"]}
+          for i in (ids if isinstance(ids, list) else [])
+          if isinstance(i, dict) and isinstance(i.get("id"), str) and PLUGIN_ID_RE.fullmatch(i["id"])
+          and type(i.get("dev")) is int and type(i.get("ino")) is int
+          and isinstance(i.get("token"), str) and TOKEN_RE.fullmatch(i["token"])][:MAX_TRUSTED]
+
+
+def listed_token(folder):
+  try:
+    return os.getxattr(folder, LISTED_XATTR, follow_symlinks=False).decode("ascii")
+  except (OSError, UnicodeDecodeError):
+    return None
+
+
+MAX_REMOTES = 5
+
+
+def git_remotes(root):
+  """The fetch and push URLs of every remote of the checkout at root, as git
+  uses them (included config and insteadOf rewrites applied); [] when root is
+  not a checkout, or None when git cannot say. git does not look above root
+  for a repository."""
+  root = Path(root)
+  if not os.path.lexists(root / ".git"):
+    return []
+  def lines(args):
+    # Exactly as git prints them: one per line, nothing else trimmed, so a
+    # URL with a leading space is not read as a GitHub URL.
+    cmd, env = git_command(args, {"GIT_CEILING_DIRECTORIES": str(root.resolve().parent)})
+    r = run_bounded(cmd, 30, cwd=root, env=env)
+    if r.returncode != 0 or (r.stdout and not r.stdout.endswith("\n")):
+      raise GuardError(f"git {args[0]} failed")
+    return r.stdout.split("\n")[:-1]
+
+  try:
+    names = lines(["remote"])
+    urls = set()
+    for name in names[:MAX_REMOTES + 1]:
+      for push in ([], ["--push"]):
+        urls.update(lines(["remote", "get-url", "--all", *push, "--", name]))
+  except (GuardError, subprocess.TimeoutExpired, OSError, RuntimeError):
+    return None
+  if len(names) > MAX_REMOTES:
+    return None
+  return sorted(urls) if names else []
+
+
+def enclosing_checkout(path):
+  """The nearest folder from path up that holds a .git, or None. The search
+  does not stop at the trusted folder, which may itself be inside a clone."""
+  for folder in [path, *path.parents]:
+    if os.path.lexists(folder / ".git"):
+      return folder
+  return None
+
+
+def github_get(path, what):
+  req = urllib.request.Request(GITHUB_API + path, headers={
+    "User-Agent": f"plugin-guard/{VERSION}", "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28"})
+  status, body = http_read(req, GITHUB_TIMEOUT, GITHUB_MAX_BYTES, what)
+  if status != 200:
+    raise ValueError(f"GitHub answered HTTP {status} for {what}")
+  data = json.loads(body)
+  if not isinstance(data, dict):
+    raise ValueError(f"GitHub sent no object for {what}")
+  return data
+
+
+def github_account(data):
+  """{"login", "id"} from a GitHub user object, checked."""
+  if (not isinstance(data, dict) or not isinstance(data.get("login"), str) or not LOGIN_RE.fullmatch(data["login"])
+      or type(data.get("id")) is not int or data["id"] <= 0):
+    raise GuardError("GitHub did not return an account login and id")
+  return {"login": data["login"], "id": data["id"]}
+
+
+def lookup_github_account(login):
+  if not LOGIN_RE.fullmatch(login or ""):
+    raise GuardError(f"'{clip(login, 60)}' is not a GitHub login")
+  try:
+    return github_account(github_get(f"/users/{urllib.parse.quote(login, safe='')}", "the GitHub account"))
+  except (OSError, ValueError) as e:
+    raise GuardError(f"could not look up the GitHub account {login}: {clip(e, 200)}")
+
+
+def detect_github_account():
+  """The github.com account the gh command is signed in to."""
+  gh = shutil.which("gh")
+  if not gh:
+    raise GuardError("the gh command is not installed; name your account with: plugin-guard own add-owner <login>")
+  try:
+    # --hostname: a GH_HOST for GitHub Enterprise would give another site's
+    # account, whose id means nothing on github.com.
+    r = run_bounded([gh, "api", "--hostname", "github.com", "user"], 20,
+                    env=dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1"), limit=1024 * 1024)
+  except (subprocess.TimeoutExpired, OSError, GuardError) as e:
+    raise GuardError(f"gh api user failed: {clip(e, 200)}")
+  if r.returncode != 0:
+    raise GuardError(f"gh api user failed (is gh signed in?): {clip((r.stderr or r.stdout).strip(), 200)}")
+  try:
+    return github_account(json.loads(r.stdout))
+  except ValueError:
+    raise GuardError("gh api user did not return JSON")
+
+
+def ownership_cache():
+  cached = read_json(OWNERSHIP_FILE, {})
+  entries = cached.get("entries") if isinstance(cached, dict) and cached.get("api") == GITHUB_API else None
+  fresh = {}
+  for key, at in (entries if isinstance(entries, dict) else {}).items():
+    age = seconds_since(at) if isinstance(at, str) else None
+    if isinstance(key, str) and age is not None and 0 <= age < OWNERSHIP_MAX_AGE:
+      fresh[key] = at
+  return fresh
+
+
+def remember_ownership(key):
+  cache = ownership_cache()
+  cache[key] = now_iso()
+  newest = sorted(cache.items(), key=lambda kv: kv[1], reverse=True)[:OWNERSHIP_MAX_ENTRIES]
+  write_json(OWNERSHIP_FILE, {"api": GITHUB_API, "entries": dict(newest)})
+  return cache[key]
+
+
+def owned_on_github(owner, name, out):
+  """The repository's name and default branch when GitHub says the account
+  owner ({"login", "id"}) owns the repository name ("owner/repo") now, else
+  None. GitHub follows a transferred or renamed repository to where it is
+  now, so the id check covers those."""
+  o, r = (urllib.parse.quote(part, safe="") for part in name.split("/"))
+  try:
+    repo = github_get(f"/repos/{o}/{r}", "the repository on GitHub")
+    if not isinstance(repo.get("owner"), dict) or repo["owner"].get("id") != owner["id"]:
+      out.progress("own", f"GitHub says {name} belongs to another account now, so it is scanned")
+      return None
+    full, branch = repo.get("full_name"), repo.get("default_branch")
+    if (not isinstance(full, str) or full.count("/") != 1 or not LOGIN_RE.fullmatch(full.split("/")[0])
+        or not REPO_NAME_RE.fullmatch(full.split("/")[1]) or not isinstance(branch, str) or not 0 < len(branch) <= 255):
+      raise ValueError("GitHub did not return the repository's name and default branch")
+    return full, branch
+  except (OSError, ValueError, GuardError) as e:
+    out.progress("own", f"Could not confirm with GitHub that {name} is yours, so it is scanned: {clip(e, 200)}")
+    return None
+
+
+def own_github(url, root, commit, config, out):
+  """Why the commit at root is yours on GitHub, or None."""
+  parsed = github_repo(url)
+  if not parsed:
+    return None
+  owner = next((o for o in trusted_owners(config) if o["login"].lower() == parsed[0].lower()), None)
+  if not owner:
+    return None
+  name = f"{parsed[0]}/{parsed[1]}"
+  found = {"reason": "github", "repo": name, "account": owner["login"], "accountIds": [owner["id"]]}
+  head = clean_head(root, commit, allow_data=True)
+  if not head:
+    out.progress("own", f"{name} has local changes or is not at the commit being checked, so it is scanned")
+    return None
+  key = f"{owner['id']}:{name.lower()}@{head}"
+  cache = ownership_cache()
+  if key in cache:
+    return dict(found, confirmedAt=cache[key])
+  out.progress("own", f"Asking GitHub whether {name} is yours")
+  repo = owned_on_github(owner, name, out)
+  if not repo:
+    return None
+  full, branch = repo
+  # Is the commit an ancestor of the default branch? Not only "in the
+  # repository": GitHub serves commits from forks through the parent too.
+  o, r = (urllib.parse.quote(part, safe="") for part in full.split("/"))
+  try:
+    compared = github_get(f"/repos/{o}/{r}/compare/{head}...{urllib.parse.quote(branch, safe='')}?per_page=1",
+                          "the commit's place in the repository's history")
+  except (OSError, ValueError, GuardError) as e:
+    out.progress("own", f"Could not confirm with GitHub that {name} is yours, so it is scanned: {clip(e, 200)}")
+    return None
+  base = compared.get("merge_base_commit")
+  if compared.get("status") not in ("ahead", "identical") or not isinstance(base, dict) or base.get("sha") != head:
+    out.progress("own", f"Commit {head[:12]} is not in the history of {name}'s {clip(branch, 60)} branch, so it is scanned")
+    return None
+  return dict(found, confirmedAt=remember_ownership(key))
+
+
+def own_remotes(remotes, config, out):
+  """When every remote is a repository one of your accounts owns, as GitHub
+  says now (cached for OWNERSHIP_MAX_AGE): the account ids that took and the
+  oldest confirmation, else None."""
+  owners = {o["login"].lower(): o for o in trusted_owners(config)}
+  ids, oldest = set(), None
+  for url in remotes[:MAX_REMOTES * 2]:
+    parsed = github_repo(url)
+    owner = owners.get(parsed[0].lower()) if parsed else None
+    if not owner:
+      return None
+    name = f"{parsed[0]}/{parsed[1]}"
+    key = f"{owner['id']}:{name.lower()}"
+    at = ownership_cache().get(key)
+    if not at:
+      out.progress("own", f"Asking GitHub whether {name} is yours")
+      if not owned_on_github(owner, name, out):
+        return None
+      at = remember_ownership(key)
+    ids.add(owner["id"])
+    oldest = min(oldest or at, at)
+  if len(remotes) > MAX_REMOTES * 2:
+    return None
+  return {"accountIds": sorted(ids), **({"confirmedAt": oldest} if oldest else {})}
+
+
+def own_local(plugin_id, root, config, out):
+  """Why the installed plugin at root is one you build locally, or None."""
+  root = Path(root)
+  if not isinstance(plugin_id, str) or root != PLUGINS_DIR / plugin_id:
+    return None
+  try:
+    st = os.lstat(root)
+  except OSError:
+    return None
+  listed = stat.S_ISDIR(st.st_mode) and any(
+    i["id"] == plugin_id and i["dev"] == st.st_dev and i["ino"] == st.st_ino and listed_token(root) == i["token"]
+    for i in trusted_plugins(config))
+  if listed and git_remotes(root) == []:
+    return {"reason": "listed", "pluginId": plugin_id}
+  if not stat.S_ISLNK(st.st_mode):
+    return None
+  try:
+    target = root.resolve(strict=True)
+  except (OSError, RuntimeError):
+    return None
+  for path in trusted_paths(config):
+    base = Path(path)
+    try:
+      # A trusted folder that is now a symlink, or has moved, is not trusted.
+      if base.resolve(strict=True) != base:
+        continue
+    except (OSError, RuntimeError):
+      continue
+    if target == base or not target.is_relative_to(base):
+      continue
+    # Inside a git checkout (perhaps a subfolder of one), it has to be a
+    # checkout of your own repositories.
+    checkout = enclosing_checkout(target)
+    evidence = {}
+    if checkout:
+      remotes = git_remotes(checkout)
+      evidence = own_remotes(remotes, config, out) if remotes is not None else None
+      if evidence is None:
+        return None
+    return {"reason": "path", "path": str(target), **evidence}
+  return None
+
+
+def own_plugin(root, source, commit, config, out):
+  """Why the plugin at root is yours, or None (also when skipOwn is off)."""
+  if not config.get("skipOwn"):
+    return None
+  kind = source.get("type")
+  if kind == "installed":
+    found = own_local(source.get("pluginId"), root, config, out)
+    if found:
+      return found
+    if not (Path(root) / ".git").is_dir():
+      return None
+    url = git(["remote", "get-url", "origin"], cwd=root, check=False, timeout=30)
+  elif kind in ("git", "update"):
+    url = source.get("url")
+  else:
+    return None
+  return own_github(url, root, commit, config, out)
+
+
+def own_still_holds(own, scanned_at, config):
+  """Whether a skip as your own (a report's ownPlugin) still stands: the
+  setting is on, the skip is recent, and the account, folder, or listing it
+  rested on is still trusted."""
+  if not config.get("skipOwn") or not isinstance(own, dict):
+    return False
+  # As old as the skip, or as GitHub's confirmation it reused, if older.
+  for stamp in (scanned_at, own.get("confirmedAt", scanned_at)):
+    age = seconds_since(stamp)
+    if age is None or not 0 <= age < OWNERSHIP_MAX_AGE:
+      return False
+  ids = own.get("accountIds", [])
+  if not isinstance(ids, list) or not {o["id"] for o in trusted_owners(config)} >= set(ids):
+    return False
+  if own.get("reason") == "github":
+    return bool(ids)
+  if own.get("reason") == "path":
+    path = Path(str(own.get("path", "")))
+    return any(path != Path(p) and path.is_relative_to(p) for p in trusted_paths(config))
+  if own.get("reason") == "listed":
+    return any(i["id"] == own.get("pluginId") for i in trusted_plugins(config))
+  return False
+
+
+def stale_own(entry, config):
+  """Whether an installed plugin's recorded skip as your own needs checking
+  again (see own_still_holds)."""
+  if not isinstance(entry, dict) or entry.get("skip") != "own":
+    return False
+  return not own_still_holds(entry.get("ownPlugin"), entry.get("scannedAt"), config)
+
+
+def own_summary(own):
+  tail = " Scan it anyway with --scan-all, or stop skipping your own plugins with: plugin-guard own off."
+  if own["reason"] == "github":
+    return (f"From {own['repo']} on GitHub, which your account {own['account']} owns, at a commit in its "
+            "history, so Plugin Guard did not scan it." + tail)
+  if own["reason"] == "path":
+    return f"Built locally in {own['path']}, inside a folder you trust, so Plugin Guard did not scan it." + tail
+  return "Listed as one of your own plugins, so Plugin Guard did not scan it." + tail
 
 
 def scan_tree(root, source, model, config, out, scan_id, commit="", changed="", skip_model=False):
@@ -1495,9 +2217,20 @@ def scan_tree(root, source, model, config, out, scan_id, commit="", changed="", 
     if verified:
       out.progress("marketplace", f"{clip(manifest.get('name') or manifest['id'], 120)} is verified in the "
                    "Omarchy Plugin Marketplace at this commit; skipping the scan")
-      report = verified_report(source, manifest, scan_id, commit or verified)
+      report = skipped_report(source, manifest, scan_id, commit or verified,
+                              "Verified in the Omarchy Plugin Marketplace at this commit, so Plugin Guard did not "
+                              "scan it. Scan it anyway with --scan-all, or scan verified plugins every time with: "
+                              "plugin-guard scan-all on.", {"marketplaceVerified": True})
       write_json(REPORTS_DIR / f"{scan_id}.json", report)
       return report
+  own = own_plugin(root, source, commit, config, out)
+  if own:
+    out.progress("own", f"{clip(manifest.get('name') or manifest['id'], 120)} is your own plugin; skipping the scan")
+    report = skipped_report(source, manifest, scan_id, commit, own_summary(own),
+                            {"ownPlugin": {k: clip(v, 4096 if k == "path" else 300) if isinstance(v, str) else v
+                                           for k, v in own.items()}})
+    write_json(REPORTS_DIR / f"{scan_id}.json", report)
+    return report
   files, inv_findings = inventory(root)
   out.progress("static", "Running static checks")
   static_findings, destinations = static_scan(files)
@@ -1655,6 +2388,8 @@ def record_installed(plugin_id, report, identity=None):
                       "commit": identity["commit"], "fingerprint": identity["fingerprint"],
                       "scannedAt": report["scannedAt"],
                       "model": (report.get("model") or {}).get("label", "")}
+  if report.get("ownPlugin"):
+    index[plugin_id].update(skip="own", ownPlugin=report["ownPlugin"])
   write_json(INDEX_FILE, index)
   seen = read_json(SEEN_FILE, None)
   if isinstance(seen, dict):
@@ -1671,6 +2406,13 @@ def load_report(scan_id):
   return report
 
 
+def require_own_holds(report):
+  """Refuse a saved report that skipped a plugin as your own when that no
+  longer holds (see own_still_holds)."""
+  if report.get("ownPlugin") and not own_still_holds(report["ownPlugin"], report.get("scannedAt"), load_config()):
+    raise GuardError("that scan skipped the plugin as your own, which no longer holds; scan it again")
+
+
 def install_scanned(scan_id, force=False, enable=False, section="", out=None):
   out = out or Out()
   report = load_report(scan_id)
@@ -1678,6 +2420,7 @@ def install_scanned(scan_id, force=False, enable=False, section="", out=None):
     raise GuardError("that scan was not of a git URL, so there is nothing to install")
   if report["verdict"] == "dangerous" and not force:
     raise GuardError("the scan found this plugin dangerous; pass --force to install it anyway")
+  require_own_holds(report)
   repo = STAGES_DIR / scan_id / "repo"
   if not (repo / ".git").is_dir():
     raise GuardError("the scanned copy is gone (scans are kept for 7 days); scan again")
@@ -1840,6 +2583,7 @@ def apply_update(scan_id, force=False, out=None):
     raise GuardError("that scan was not of a plugin update")
   if report["verdict"] == "dangerous" and not force:
     raise GuardError("the scan found this update dangerous; pass --force to apply it anyway")
+  require_own_holds(report)
   plugin_id = source["pluginId"]
   target = PLUGINS_DIR / plugin_id
   if not (target / ".git").is_dir():
@@ -1850,7 +2594,11 @@ def apply_update(scan_id, force=False, out=None):
   # The scanned commit's objects are already in the plugin's repository from
   # the fetch; merging it, rather than pulling again, applies exactly that.
   git(["merge", "--ff-only", "--quiet", report["commit"]], cwd=target)
-  record_installed(plugin_id, report)
+  # A skip (verified, or your own) covered the staged commit, not this
+  # folder, which can hold local files the merge kept: the sweep checks the
+  # folder itself.
+  if not not_scanned(report):
+    record_installed(plugin_id, report)
   rescan_plugins()
   return {"ok": True, "pluginId": plugin_id, "applied": True, "commit": report["commit"]}
 
@@ -1865,8 +2613,8 @@ def check_installed(plugin_id, model, config, out, skip_model=False):
   report = scan_tree(target, {"type": "installed", "pluginId": plugin_id}, model, config, out,
                      scan_id, identity["commit"], skip_model=skip_model)
   # A static-only check is never conclusive, so it does not replace the
-  # plugin's recorded result. A marketplace verification is.
-  if not skip_model or report.get("marketplaceVerified"):
+  # plugin's recorded result. A skip (verified, or your own) is.
+  if not skip_model or not_scanned(report):
     record_installed(plugin_id, report, identity)
   return report
 
@@ -1937,10 +2685,14 @@ def gate(kind, args, config, out):
   # The plugin is not in place yet; the sweep records this result once the
   # installed commit matches, instead of scanning it again. A review the model
   # did not finish is left for the sweep to complete.
-  if report["modelVerdict"] or report.get("marketplaceVerified"):
-    pending = read_json(PENDING_FILE, {})
+  # A skip (verified, or your own) is not handed on: it covered the staged
+  # copy, and the sweep checks the installed folder itself, against the
+  # settings then in force.
+  pending = read_json(PENDING_FILE, {})
+  pending.pop(plugin_id, None)
+  if report["modelVerdict"]:
     pending[plugin_id] = {"scanId": report["scanId"], "commit": commit}
-    write_json(PENDING_FILE, pending)
+  write_json(PENDING_FILE, pending)
   return 0
 
 
@@ -1953,9 +2705,11 @@ def take_pending(plugin_id, identity):
   if not entry.get("commit") or entry["commit"] != identity["commit"]:
     return None
   try:
-    return load_report(entry["scanId"])
+    report = load_report(entry["scanId"])
   except GuardError:
     return None
+  # A skip covered the staged copy, not the installed folder.
+  return None if not_scanned(report) or not report.get("modelVerdict") else report
 
 
 def disable_plugin(plugin_id):
@@ -2005,7 +2759,8 @@ def sweep(config, out):
 
   index = read_json(INDEX_FILE, {})
   changed = [p for p in plugins
-             if not matches(seen.get(p["id"]), current[p["id"]]) and not matches(index.get(p["id"]), current[p["id"]])]
+             if (not matches(seen.get(p["id"]), current[p["id"]]) and not matches(index.get(p["id"]), current[p["id"]]))
+             or stale_own(index.get(p["id"]), config)]
   # Forget plugins that were removed; mark ones Plugin Guard already scanned.
   seen = {pid: ident for pid, ident in seen.items() if pid in current}
   for p in plugins:
@@ -2045,15 +2800,26 @@ def sweep(config, out):
              f"{worst['title']} ({worst['file']}:{worst['line']}). Open Plugin Guard for the report.", "critical")
 
     report = quick
-    if quick.get("marketplaceVerified"):
+    if not_scanned(quick):
       record_installed(pid, quick, identity)
       results.append({"id": pid, "verdict": "safe", "disabled": False, "scanId": quick["scanId"],
-                      "marketplaceVerified": True})
+                      "marketplaceVerified": bool(quick.get("marketplaceVerified")),
+                      "ownPlugin": bool(quick.get("ownPlugin"))})
       continue
     if model:
       report = scan_tree(target, {"type": "installed", "pluginId": pid}, model, config, out, new_scan_id(pid),
                          identity["commit"])
+    if not_scanned(report) and quick["staticVerdict"] == "dangerous":
+      # Skipped on this pass only (GitHub answered this time), but the static
+      # checks already found it dangerous: keep that result and its findings.
+      report = quick
     record_installed(pid, report, identity)
+    if not_scanned(report):
+      # Skipped on this pass only, say because GitHub answered this time.
+      results.append({"id": pid, "verdict": "safe", "disabled": disabled, "scanId": report["scanId"],
+                      "marketplaceVerified": bool(report.get("marketplaceVerified")),
+                      "ownPlugin": bool(report.get("ownPlugin"))})
+      continue
     if report["verdict"] == "dangerous" and not disabled and quick["staticVerdict"] != "dangerous":
       disabled = bool(p.get("enabled")) and disable_plugin(pid)
       notify(f"{name} looks dangerous" + (" and was disabled" if disabled else ""),
@@ -2089,7 +2855,7 @@ def matches(entry, identity):
   return bool(entry.get("commit")) and entry["commit"] == identity["commit"]
 
 
-def installed_status():
+def installed_status(config):
   index = read_json(INDEX_FILE, {})
   rows = []
   for p in third_party_plugins():
@@ -2099,7 +2865,7 @@ def installed_status():
     entry = index.get(pid)
     state = "unscanned"
     if entry:
-      state = "scanned" if matches(entry, identity) else "changed"
+      state = "scanned" if matches(entry, identity) and not stale_own(entry, config) else "changed"
     rows.append({
       "id": pid, "name": clip(p.get("name") or pid, 120), "enabled": bool(p.get("enabled")),
       "git": bool(head), "state": state, "commit": head,
@@ -2146,6 +2912,8 @@ def print_report(report, file=None, verbose=False):
     print(f"Model:  {t(report['model'].get('label'))}", file=file)
   if report.get("marketplaceVerified"):
     print(f"Verdict: {paint(verdict.upper(), COLORS[verdict])}   (verified in the Omarchy Plugin Marketplace; not scanned)", file=file)
+  elif report.get("ownPlugin"):
+    print(f"Verdict: {paint(verdict.upper(), COLORS[verdict])}   (your own plugin; not scanned)", file=file)
   else:
     print(f"Verdict: {paint(verdict.upper(), COLORS[verdict])}"
           f"   (static checks: {known(report.get('staticVerdict'), VERDICTS, 'unknown')},"
@@ -2220,8 +2988,7 @@ def cmd_models(args, config):
 
 def cmd_set_model(args, config):
   model = resolve_model(config, args.model)
-  config["model"] = model["id"]
-  save_config(config)
+  update_config(lambda c: c.update(model=model["id"]))
   if args.json:
     print(json.dumps({"ok": True, "model": model["id"], "label": model["label"]}))
   else:
@@ -2260,8 +3027,7 @@ def cmd_paste(args, config):
 
 def cmd_scan_all(args, config):
   if args.state:
-    config["scanAll"] = args.state == "on"
-    save_config(config)
+    config = update_config(lambda c: c.update(scanAll=args.state == "on"))
   on = bool(config.get("scanAll"))
   if args.json:
     print(json.dumps({"ok": True, "scanAll": on}))
@@ -2270,6 +3036,109 @@ def cmd_scan_all(args, config):
   else:
     print("Scan all is off: plugins verified in the Omarchy Plugin Marketplace at the commit "
           "being checked are skipped.")
+  return 0
+
+
+def own_state(config):
+  return {"skipOwn": bool(config.get("skipOwn")), "owners": trusted_owners(config),
+          "paths": trusted_paths(config), "plugins": trusted_plugins(config)}
+
+
+def cmd_own(args, config):
+  action, value, note = args.action, args.value, ""
+  if action in ("remove-owner", "add-path", "remove-path", "add-plugin", "remove-plugin") and not value:
+    raise GuardError(f"own {action} needs a value")
+  # Everything that can be slow (gh, GitHub) or fail happens first; the
+  # change itself is made under config_lock to the settings as saved then.
+  account = entry = path = None
+  if action == "on" and not (trusted_owners(config) or trusted_paths(config) or trusted_plugins(config)):
+    # Nothing counts as yours yet: start with the account gh is signed in to.
+    try:
+      account = detect_github_account()
+      note = f"Added your GitHub account {account['login']}, the one gh is signed in to."
+    except GuardError as e:
+      note = f"Nothing counts as your own yet ({e})."
+  elif action == "add-owner":
+    account = lookup_github_account(value) if value else detect_github_account()
+  elif action in ("add-path", "remove-path"):
+    try:
+      path = Path(value).expanduser().resolve(strict=action == "add-path")
+    except (OSError, RuntimeError) as e:
+      raise GuardError(f"cannot use {value}: {e}")
+    if action == "add-path":
+      plugins_dir = PLUGINS_DIR.resolve()
+      if not path.is_dir():
+        raise GuardError(f"{path} is not a folder")
+      if path in (Path("/"), HOME.resolve()) or plugins_dir.is_relative_to(path) or path.is_relative_to(plugins_dir):
+        raise GuardError(f"{path} is too broad to trust; name the folder your plugins' source is in, such as ~/Projects")
+  elif action in ("add-plugin", "remove-plugin"):
+    if not PLUGIN_ID_RE.fullmatch(value):
+      raise GuardError(f"'{clip(value, 60)}' is not a plugin id")
+    if action == "add-plugin":
+      folder = PLUGINS_DIR / value
+      try:
+        st = os.lstat(folder)
+      except OSError:
+        raise GuardError(f"plugin '{value}' is not installed in {PLUGINS_DIR}")
+      if stat.S_ISLNK(st.st_mode):
+        raise GuardError(f"{value} is a symlink; trust the folder it is in with: plugin-guard own add-path <folder>")
+      if not stat.S_ISDIR(st.st_mode):
+        raise GuardError(f"{folder} is not a folder")
+      if git_remotes(folder) != []:
+        raise GuardError(f"{value} is a git checkout with remotes; add its GitHub account with: "
+                         "plugin-guard own add-owner <login>")
+      entry = {"id": value, "dev": st.st_dev, "ino": st.st_ino}
+
+  def change(c):
+    owners, paths, plugins = trusted_owners(c), trusted_paths(c), trusted_plugins(c)
+    if action in ("on", "off"):
+      c["skipOwn"] = action == "on"
+    if account:
+      owners = [o for o in owners if o["id"] != account["id"] and o["login"].lower() != account["login"].lower()]
+      owners.append(account)
+    elif action == "remove-owner":
+      owners = [o for o in owners if o["login"].lower() != value.lower()]
+    elif action == "add-path":
+      paths = [p for p in paths if p != str(path)] + [str(path)]
+    elif action == "remove-path":
+      paths = [p for p in paths if p not in (str(path), value)]
+    elif action in ("add-plugin", "remove-plugin"):
+      kept = [i for i in plugins if i["id"] != value]
+      if entry:
+        if len(kept) >= MAX_TRUSTED:
+          raise GuardError(f"each list holds at most {MAX_TRUSTED} entries")
+        # Mark the folder it is listed with, so one that replaces it is not
+        # trusted; a folder already listed keeps its mark.
+        folder = PLUGINS_DIR / value
+        token = next((i["token"] for i in plugins if i["id"] == value and i["dev"] == entry["dev"]
+                      and i["ino"] == entry["ino"] and listed_token(folder) == i["token"]), None)
+        if not token:
+          token = os.urandom(16).hex()
+          try:
+            os.setxattr(folder, LISTED_XATTR, token.encode(), follow_symlinks=False)
+          except OSError as e:
+            raise GuardError(f"cannot mark {folder} as listed (its file system needs extended attributes): {e}")
+        kept.append(dict(entry, token=token))
+      plugins = kept
+    if max(len(owners), len(paths), len(plugins)) > MAX_TRUSTED:
+      raise GuardError(f"each list holds at most {MAX_TRUSTED} entries")
+    c.update(trustedOwners=owners, trustedPaths=paths, trustedPlugins=plugins)
+
+  if action:
+    config = update_config(change)
+  state = own_state(config)
+  if args.json:
+    print(json.dumps({"ok": True, **state, "note": note}))
+    return 0
+  print(f"Skipping your own plugins: {'on' if state['skipOwn'] else 'off'}")
+  print("  GitHub accounts: " + (", ".join(f"{o['login']} (id {o['id']})" for o in state["owners"]) or "none"))
+  print("  Trusted folders: " + (", ".join(term_safe(p) for p in state["paths"]) or "none"))
+  print("  Listed plugins:  " + (", ".join(i["id"] for i in state["plugins"]) or "none"))
+  if note:
+    print(term_safe(note, prose=True))
+  if state["skipOwn"] and not (state["owners"] or state["paths"] or state["plugins"]):
+    print("Add your GitHub account with: plugin-guard own add-owner <login>, a folder with: plugin-guard own "
+          "add-path ~/Projects, or a plugin with: plugin-guard own add-plugin <id>")
   return 0
 
 
@@ -2522,10 +3391,10 @@ def cmd_check(args, config):
 
 
 def cmd_status(args, config):
-  rows = installed_status()
+  rows = installed_status(config)
   if args.json:
     print(json.dumps({"plugins": rows, "model": config.get("model", ""), "setupNeeded": setup_needed(),
-                      "scanAll": bool(config.get("scanAll"))}))
+                      "scanAll": bool(config.get("scanAll")), "skipOwn": bool(config.get("skipOwn"))}))
     return 0
   for r in rows:
     label = {"unscanned": "not scanned", "changed": "changed since scan"}.get(r["state"], r["verdict"])
@@ -2612,7 +3481,7 @@ def main(argv=None):
   def scan_all(p):
     group = p.add_mutually_exclusive_group()
     group.add_argument("--scan-all", dest="scan_all", action="store_const", const=True, default=None,
-                       help="also scan plugins verified in the Omarchy Plugin Marketplace, for this run")
+                       help="for this run, also scan plugins verified in the Omarchy Plugin Marketplace, and your own")
     group.add_argument("--skip-verified", dest="scan_all", action="store_const", const=False,
                        help="skip plugins verified in the marketplace for this run, even with scan-all on")
 
@@ -2705,6 +3574,15 @@ def main(argv=None):
   p.add_argument("--json", action="store_true")
   p.set_defaults(func=cmd_scan_all)
 
+  p = sub.add_parser("own", help="skip your own plugins (on/off), and say which plugins are yours")
+  p.add_argument("action", nargs="?", choices=["on", "off", "add-owner", "remove-owner", "add-path", "remove-path",
+                                               "add-plugin", "remove-plugin"],
+                 help="omit to show the current settings")
+  p.add_argument("value", nargs="?", help="a GitHub login, a folder, or a plugin id; add-owner without one "
+                                          "uses the account gh is signed in to")
+  p.add_argument("--json", action="store_true")
+  p.set_defaults(func=cmd_own)
+
   p = sub.add_parser("setup-state", help="record that install.sh ran, or hide the reminder to run it")
   p.add_argument("action", choices=["done", "dismiss"])
   p.set_defaults(func=cmd_setup_state)
@@ -2721,22 +3599,31 @@ def main(argv=None):
     job = {"name": args.job_name, "kind": args.job_kind or command, "target": args.job_target,
            "unit": args.job_unit, "id": f"{int(time.time() * 1000)}-{os.getpid()}"}
   args.out = Out(getattr(args, "events", False), job)
-  config = load_config()
-  if command in SCANNING_COMMANDS:
-    # --scan-all and --skip-verified override the saved setting for this run
-    # only; scanning commands never save the config.
-    flag = getattr(args, "scan_all", None)
-    if flag is not None:
-      config["scanAll"] = flag
-    if config.get("scanAll"):
-      args.out.progress("start", SCAN_ALL_NOTE + (SCAN_ALL_FLAG if flag else SCAN_ALL_SETTING))
-    else:
-      args.out.progress("start", SKIP_VERIFIED_NOTE)
+  def settings():
+    config = load_config()
+    if command in SCANNING_COMMANDS:
+      # --scan-all and --skip-verified override the saved setting for this run
+      # only; scanning commands never save the config.
+      flag = getattr(args, "scan_all", None)
+      if flag is not None:
+        config["scanAll"] = flag
+      if flag:
+        config["skipOwn"] = False
+      if config.get("scanAll"):
+        args.out.progress("start", SCAN_ALL_NOTE + (SCAN_ALL_FLAG if flag else SCAN_ALL_SETTING))
+      else:
+        args.out.progress("start", SKIP_VERIFIED_NOTE)
+      if config.get("skipOwn"):
+        args.out.progress("start", SKIP_OWN_NOTE)
+    return config
+
   try:
     if command in LOCKED_COMMANDS:
       with guard_lock(args.out):
-        return args.func(args, config)
-    return args.func(args, config)
+        # Read once the lock is held: a command that waited for another scan
+        # must follow the settings as they are now (say, own off).
+        return args.func(args, settings())
+    return args.func(args, settings())
   except (GuardError, subprocess.TimeoutExpired) as e:
     args.out.error(str(e))
     if not getattr(args, "events", False):

@@ -40,6 +40,34 @@ The setting is saved in `~/.config/plugin-guard/config.json` (`"scanAll"`), so t
 plugin-guard add https://github.com/owner/plugin --scan-all
 ```
 
+## Your own plugins
+
+Starting with version 1.0.13, Plugin Guard can skip plugins that are yours: ones from your own GitHub account, and ones you build locally. This is off by default. Turn it on with **Skip my own plugins** in the widget's panel, or run:
+
+```bash
+plugin-guard own on                   # skip your own plugins
+plugin-guard own off                  # scan them again (the default)
+plugin-guard own                      # show the settings
+plugin-guard own add-owner [login]    # a GitHub account; without a login, the one gh is signed in to
+plugin-guard own add-path ~/Projects  # a folder you build plugins in
+plugin-guard own add-plugin <id>      # a plugin you built that is not a git clone
+plugin-guard own remove-owner|remove-path|remove-plugin <value>
+```
+
+`own on` with nothing set up yet adds the GitHub account the `gh` command is signed in to. A skipped plugin is reported as `safe`, with a note that it is yours and was not scanned. `--scan-all` scans your own plugins too, for one run.
+
+A plugin counts as yours in three cases. Anything else is scanned as usual.
+
+- **From your GitHub account.** The plugin's source is `https://github.com/<account>/<repo>`, or its installed clone's `origin` is, for an account you added. Before skipping, Plugin Guard asks GitHub's API two things, without signing in:
+  - Who owns the repository now. The owner must be your account, matched by GitHub's permanent numeric account id, which `add-owner` saves, not by the login. A repository you transferred away, or a login someone else registered after you gave it up, is scanned.
+  - Whether the commit is in the history of the repository's default branch. A commit pushed to a fork, which GitHub also serves through the parent repository, is scanned.
+
+  The files must be exactly that commit. Plugin Guard hashes every file itself and compares it with the commit's objects, which it also hashes as it reads them. It doesn't rely on `git status`, so the clone's own index and settings can't hide a change, and it never fetches anything. A symlink in the commit must lead, through folders and links the commit also holds, to a file in the commit, never through `.git` or outside the plugin. The only extra files allowed are settings a plugin saves in its own folder, and only when the commit's own `.gitignore` excludes them: `.json`, `.toml`, `.ini`, `.conf`, `.cfg`, `.yaml`, `.yml`, `.txt`, `.log` or `.csv` files, up to 1 MB, not executable, and never a `manifest.json`. Ignore rules in the clone's `.git` folder or your global git settings don't count. Any other change means a scan. So does an ssh remote (an ssh config can point `github.com` somewhere else), a private repository (the API is asked without signing in), or GitHub not answering in time. A confirmation is kept for six hours in `~/.local/state/plugin-guard/ownership.json`. GitHub allows 60 such requests an hour, and each new commit uses two.
+- **Built in a folder you trust.** The plugin's folder in `~/.config/omarchy/plugins` is a symlink into a folder you added with `add-path`. If the plugin is inside a git checkout (its own, one it is a subfolder of, or one the trusted folder is inside), every remote of that checkout must be a repository GitHub confirms one of your accounts owns. That keeps a clone of someone else's repository in `~/Projects` from being skipped. A trusted folder that is later replaced by a symlink is no longer trusted. A folder that holds the plugins folder, your home folder, and `/` are refused as too broad.
+- **Listed by id.** You listed the plugin with `add-plugin`, and its folder is a real folder (not a symlink; use `add-path` for those) that is not a git checkout with remotes. `add-plugin` marks the folder with a random token, in an extended attribute (`user.plugin-guard.own`) that's saved with the listing. A folder that replaces it later, such as another plugin with the same id, doesn't have the token and is scanned.
+
+A skip is checked again after six hours, when you turn **Skip my own plugins** off, and when you remove the account, folder, or listing it rested on. A plugin that stops counting as yours is then scanned by the next background check, and a saved scan that skipped it can no longer be installed or applied. After an update skipped this way is applied, the background check looks at the installed folder itself, in case it holds local files the update kept. Skipping trusts whoever can change those sources: anyone who can push to your repositories or write to the folders you trust. If your GitHub account or a trusted folder may have been tampered with, run `plugin-guard own off`.
+
 ## What it covers
 
 Omarchy has no supported way to put a check in front of `omarchy plugin add` and `omarchy plugin update`, so Plugin Guard covers them in two ways:
@@ -109,6 +137,7 @@ Click it to open the panel:
 
 - **Model picker.** Pick from every local and frontier model that is available.
 - **Scan verified plugins too.** Off by default, so plugins verified in the Omarchy Plugin Marketplace are skipped. Turn it on to scan them as well, in the background check and before installs too.
+- **Skip my own plugins.** Off by default. Turn it on to skip [your own plugins](#your-own-plugins).
 - **Check a plugin before installing.** Paste a git URL and press Scan. The report shows the verdict, a plain-language summary, whether the code matches its stated purpose, the findings with file and line, the network destinations, and the files that could not be reviewed. From the report, Install or Install and enable. A dangerous plugin needs a second click.
 - **Plugin Guard updates.** When a newer Plugin Guard is on GitHub, the panel shows its version and the commits it adds, with an **Update Plugin Guard** button. It checks when the panel opens, at most every six hours.
 - **Installed plugins.** Each plugin shows its latest result. Scan checks it in place. Update scans the incoming upstream update and offers Apply update.
@@ -130,10 +159,11 @@ plugin-guard sweep                      # check plugins installed or changed out
 plugin-guard status                     # installed plugins and their results
 plugin-guard self-update                # update Plugin Guard itself (--check to only look)
 plugin-guard scan-all on|off            # scan marketplace-verified plugins too, or skip them
+plugin-guard own on|off                 # skip your own plugins, or scan them (see "Your own plugins")
 plugin-guard report <scan-id|plugin-id> # show a saved report
 ```
 
-Plugins verified in the Omarchy Plugin Marketplace are skipped unless `plugin-guard scan-all on` is set. Add `--scan-all` or `--skip-verified` to any scan to override that setting for one run.
+Plugins verified in the Omarchy Plugin Marketplace are skipped unless `plugin-guard scan-all on` is set. Add `--scan-all` or `--skip-verified` to any scan to override that setting for one run. `--scan-all` also scans your own plugins when `own on` is set.
 
 Add `--model <id>` to any scan to override the current model, `--no-model` for static checks only, `-v` to include minor findings, and `--json` for machine-readable output.
 
@@ -215,8 +245,8 @@ These defenses reduce the risk without removing it. Wording the static rule does
 
 Plugin Guard runs inside your shell session, so nothing it reads may hang it or fill its memory. Everything it reads is limited while it is read, not afterwards:
 
-- **Commands** (`git`, `omarchy`, and the model CLIs) have an absolute deadline, and their output is capped as it arrives. Each runs in a process group of its own, which is killed on a timeout or overflow, and once the command exits, so nothing it started is left running.
-- **Network requests** (the local model server, and the marketplace catalog) have a deadline for the whole request, name lookup and connecting included, and a byte cap on the reply, including on error responses. Each request runs in a short-lived child process that is killed at the deadline, so none outlives the call that made it.
+- **Commands** (`git`, `omarchy`, `gh`, and the model CLIs) have an absolute deadline, and their output is capped as it arrives. Each runs in a process group of its own, which is killed on a timeout or overflow, and once the command exits, so nothing it started is left running.
+- **Network requests** (the local model server, the marketplace catalog, and GitHub's API when you skip your own plugins) have a deadline for the whole request, name lookup and connecting included, and a byte cap on the reply, including on error responses. Each request runs in a short-lived child process that is killed at the deadline, so none outlives the call that made it.
 - **Saved files** (settings, reports, and state) are size-capped, and anything that is not a regular file is refused without blocking on it. Reports keep at most 300 static findings, the most severe first. The verdict still counts every one.
 - **Pasting into the widget's URL field** never uses Qt's own clipboard reader, which reads the whole clipboard first with no limit. Ctrl+V, Shift+Insert, the Paste key, the right-click menu, and middle-click paste instead run `plugin-guard paste`, which reads at most 4 KiB within two seconds. A paste whose reply comes after you typed, moved the cursor, or left the field is dropped. Text dragged onto the field is discarded unread.
 - **The widget's own commands** have deadlines too, and recover from one that fails to start.
