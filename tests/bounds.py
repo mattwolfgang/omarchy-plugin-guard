@@ -4,12 +4,14 @@ deadline. Run by tests/run.sh as: python3 -I bounds.py <bin/plugin-guard>.
 Each case prints "ok   name" or "FAIL name"; the exit status is 1 if any
 failed. Servers bind to 127.0.0.1 on a free port; nothing leaves the machine.
 """
+import atexit
 import contextlib
 import http.server
 import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -27,6 +29,7 @@ loader.exec_module(pg)
 
 failed = False
 work = Path(tempfile.mkdtemp(prefix="plugin-guard-bounds-"))
+atexit.register(shutil.rmtree, work, True)
 
 
 def case(name):
@@ -376,6 +379,62 @@ def _():
                      capture_output=True, text=True, timeout=30)
   reply = json.loads(r.stdout)
   return None if reply.get("ok") is False and "wl-paste" in reply.get("error", "") else repr(reply)
+
+
+@case("http_read rejects file:// and non-http schemes")
+def _():
+  secret = work / "secret.txt"
+  secret.write_text("top-secret")
+  try:
+    pg.http_read(f"file://{secret}", 5, 1024, "test server")
+    return "accepted file:// URL"
+  except ValueError:
+    return None
+
+
+@case("a FIFO inside a scanned plugin directory does not block inventory")
+def _():
+  plugin = work / "fifo-plugin"
+  plugin.mkdir()
+  (plugin / "manifest.json").write_text(json.dumps({"id": "test.fifo", "name": "Fifo"}))
+  os.mkfifo(plugin / "pipe.txt")
+  code = (
+    "import importlib.machinery, importlib.util, json, sys; "
+    "l = importlib.machinery.SourceFileLoader('pg', sys.argv[1]); "
+    "s = importlib.util.spec_from_loader('pg', l); m = importlib.util.module_from_spec(s); l.exec_module(m); "
+    "_, f = m.inventory(sys.argv[2]); print(json.dumps([x['rule'] for x in f]))"
+  )
+  try:
+    r = subprocess.run([sys.executable, "-I", "-c", code, str(GUARD), str(plugin)],
+                       capture_output=True, text=True, timeout=5)
+  except subprocess.TimeoutExpired:
+    return "inventory() hung on FIFO"
+  if r.returncode != 0:
+    return f"exit {r.returncode}: {r.stderr.strip()}"
+  rules = set(json.loads(r.stdout))
+  return None if "special-file" in rules else f"missing special-file finding: {rules}"
+
+
+@case("batched model discovery keeps healthy servers when another server stalls")
+def _():
+  class Silent(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+      time.sleep(10)
+    def log_message(self, *args):
+      pass
+  stalled = Server(("127.0.0.1", 0), Silent)
+  stalled.daemon_threads = True
+  threading.Thread(target=stalled.serve_forever, daemon=True).start()
+  try:
+    models = pg.fetch_endpoints_models(
+      [serve("models").rstrip("/"), f"http://127.0.0.1:{stalled.server_address[1]}"], timeout=1)
+  finally:
+    stalled.shutdown()
+  if not isinstance(models, list) or len(models) != 2:
+    return f"unexpected result: {models!r}"
+  if not models[0] or len(models[0]) != pg.MAX_MODELS or models[1] is not None:
+    return f"got {(len(models[0]) if models[0] else None, models[1])}"
+  return None
 
 
 server.shutdown()

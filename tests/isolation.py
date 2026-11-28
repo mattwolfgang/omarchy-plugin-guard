@@ -7,10 +7,12 @@ directory and environment they were started with, and answer with a fixed
 review. Nothing is sent to a model. Each case prints "ok   name" or
 "FAIL name"; the exit status is 1 if any failed.
 """
+import atexit
 import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -24,6 +26,7 @@ loader.exec_module(pg)
 
 failed = False
 work = Path(tempfile.mkdtemp(prefix="plugin-guard-isolation-"))
+atexit.register(shutil.rmtree, work, True)
 bindir = work / "bin"
 bindir.mkdir()
 record = work / "launch.json"

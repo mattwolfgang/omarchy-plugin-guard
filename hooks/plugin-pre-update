@@ -3,9 +3,13 @@
 # exits non-zero to refuse a dangerous update.
 # Arguments: <plugin-dir> <id> <current-commit> <incoming-commit>.
 # A missing Plugin Guard allows the update rather than blocking every one.
-guard=${PLUGIN_GUARD_BIN:-$HOME/.local/bin/plugin-guard}
+# Resolve plugin-guard relative to this hook first, then ~/.local/bin, without
+# trusting environment overrides.
+hook_real=$(realpath -e "${BASH_SOURCE[0]}" 2>/dev/null || true)
+guard=${hook_real:+$(dirname "$(dirname "$hook_real")")/bin/plugin-guard}
+[[ -n $guard && -x $guard ]] || guard="$HOME/.local/bin/plugin-guard"
 if [[ ! -x $guard ]]; then
   echo "Plugin Guard is not installed at $guard; allowing this without a scan" >&2
   exit 0
 fi
-exec "$guard" gate update "$@"
+exec "$guard" gate update -- "$@"

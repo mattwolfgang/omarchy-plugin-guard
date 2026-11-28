@@ -38,7 +38,8 @@ for arg in "$@"; do
     --find-models) models=yes ;;
     --no-find-models) models=no ;;
     -*) echo "install.sh: unknown option $arg" >&2; exit 1 ;;
-    *) section=$arg ;;
+    left|centerBegin|center|centerEnd|tray|right) section=$arg ;;
+    *) echo "install.sh: unknown bar section '$arg' (expected left, centerBegin, center, centerEnd, tray, or right)" >&2; exit 1 ;;
   esac
 done
 
@@ -70,7 +71,7 @@ ln -sfn "$dest/bin/plugin-guard" "$HOME/.local/bin/plugin-guard"
 if grep -qF "omarchy-plugin-guard.bash" "$HOME/.bashrc" 2>/dev/null; then
   : # Already added on an earlier run.
 elif consent "$bashrc" "Add a line to ~/.bashrc so typed 'omarchy plugin add|update' commands are scanned first?"; then
-  line="[[ -r $dest/shell/omarchy-plugin-guard.bash ]] && source $dest/shell/omarchy-plugin-guard.bash"
+  printf -v line '[[ -r %q ]] && source %q' "$dest/shell/omarchy-plugin-guard.bash" "$dest/shell/omarchy-plugin-guard.bash"
   printf '\n# Plugin Guard: scan plugins typed into `omarchy plugin add|update` first\n%s\n' "$line" >>"$HOME/.bashrc"
   echo "Added Plugin Guard to ~/.bashrc; open a new terminal for it to take effect. Remove that line to undo it."
 fi

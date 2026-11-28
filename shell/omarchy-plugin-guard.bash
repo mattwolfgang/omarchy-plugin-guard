@@ -7,20 +7,24 @@
 # `command omarchy ...`.
 omarchy() {
   local guard=${PLUGIN_GUARD_BIN:-$HOME/.local/bin/plugin-guard}
-  # Once Omarchy runs Plugin Guard as its pre-install hook, the real command
-  # is already guarded.
-  if [[ -e $HOME/.config/omarchy/hooks/plugin-pre-install.d/plugin-guard ]] && command -v omarchy-hook-gate >/dev/null 2>&1; then
-    command omarchy "$@"
-    return
-  fi
+  local has_gate=0
+  command -v omarchy-hook-gate >/dev/null 2>&1 && has_gate=1
   if [[ ${1-} == plugin && -z ${PLUGIN_GUARD_BYPASS-} && -x $guard ]]; then
     case ${2-} in
       add | install)
+        if (( has_gate )) && [[ -e $HOME/.config/omarchy/hooks/plugin-pre-install.d/plugin-guard ]]; then
+          command omarchy "$@"
+          return
+        fi
         shift 2
         "$guard" add "$@"
         return
         ;;
       update)
+        if (( has_gate )) && [[ -e $HOME/.config/omarchy/hooks/plugin-pre-update.d/plugin-guard ]]; then
+          command omarchy "$@"
+          return
+        fi
         shift 2
         "$guard" update "$@"
         return

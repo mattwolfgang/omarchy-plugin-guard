@@ -135,9 +135,16 @@ Panel {
 
   function shortCommit(sha) { return sha ? String(sha).substring(0, 7) : "" }
 
+  // Single-pass positional formatting (%1, %2) so a %2 inside an untrusted
+  // first argument is never expanded by a second .arg() call.
+  function fmt(template, a, b) {
+    var vals = [String(a === undefined || a === null ? "" : a), String(b === undefined || b === null ? "" : b)]
+    return String(template || "").replace(/%([12])/g, function(_, n) { return vals[Number(n) - 1] })
+  }
+
   // ---- Commands.
   function unitCommand(unit, name, kind, target, args) {
-    return ["systemd-run", "--user", "--collect", "--quiet", "--unit=" + unit,
+    return ["systemd-run", "--user", "--collect", "--quiet", "--expand-environment=no", "--unit=" + unit,
             "-E", "PATH=" + (Quickshell.env("PATH") || ""),
             "--", "python3", "-I", guardScript,
             "--job-name", name, "--job-kind", kind, "--job-target", target, "--job-unit", unit].concat(args)
@@ -215,7 +222,7 @@ Panel {
   function scanUrl() {
     var url = urlField.text.trim()
     if (url === "") return
-    runJob("scan", url, ["scan", url])
+    runJob("scan", url, ["scan", "--", url])
   }
 
   function installReport(enable) {
@@ -224,9 +231,10 @@ Panel {
       confirmDangerous = true
       return
     }
-    var args = ["install", report.scanId]
+    var args = ["install"]
     if (enable) args.push("--enable")
     if (report.verdict === "dangerous") args.push("--force")
+    args.push("--", report.scanId)
     runJob("install", report.plugin.name || report.plugin.id, args)
   }
 
@@ -236,13 +244,14 @@ Panel {
       confirmDangerous = true
       return
     }
-    var args = ["apply-update", report.scanId]
+    var args = ["apply-update"]
     if (report.verdict === "dangerous") args.push("--force")
+    args.push("--", report.scanId)
     runJob("apply", report.plugin.name || report.plugin.id, args)
   }
 
-  function checkPlugin(p) { runJob("check", p.name || p.id, ["check", p.id]) }
-  function checkUpdate(p) { runJob("update", p.name || p.id, ["update", p.id, "--check-only"]) }
+  function checkPlugin(p) { runJob("check", p.name || p.id, ["check", "--", p.id]) }
+  function checkUpdate(p) { runJob("update", p.name || p.id, ["update", "--check-only", "--", p.id]) }
   // install.sh asks questions, so it runs in a terminal. The launcher passes
   // its arguments through bash -c, hence the quoting.
   readonly property string installScript: String(Qt.resolvedUrl("install.sh")).replace(/^file:\/\//, "")
@@ -269,7 +278,7 @@ Panel {
 
   function openSavedReport(scanId) {
     if (!scanId || reportProc.running) return
-    reportProc.command = ["python3", "-I", guardScript, "report", scanId, "--json"]
+    reportProc.command = ["python3", "-I", guardScript, "report", "--json", "--", scanId]
     reportProc.start()
   }
 
@@ -298,7 +307,7 @@ Panel {
   function setModel(id) {
     if (!id || id === currentModel) return
     currentModel = id
-    setModelProc.command = ["python3", "-I", guardScript, "set-model", id, "--json"]
+    setModelProc.command = ["python3", "-I", guardScript, "set-model", "--json", "--", id]
     setModelProc.start()
   }
 
@@ -345,15 +354,15 @@ Panel {
   }
 
   // Watches miss a file that is created after the watch starts, so read the
-  // state files directly while something is running.
+  // active state file(s) directly while something is running.
   Timer {
     interval: 1500
     repeat: true
     running: root.busy || root.sweeping
     onTriggered: {
       root.now = Date.now()
-      jobFile.reload()
-      sweepFile.reload()
+      if (root.busy) jobFile.reload()
+      if (root.sweeping) sweepFile.reload()
     }
   }
 
@@ -570,7 +579,7 @@ Panel {
               anchors.right: cancelButton.left
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
-              text: strings.t("check.elapsed").arg(root.jobMessage || root.jobTarget).arg(Commons.I18n.formatNumber(root.elapsed))
+              text: root.fmt(strings.t("check.elapsed"), root.jobMessage || root.jobTarget, Commons.I18n.formatNumber(root.elapsed))
               color: root.dim
               elide: Text.ElideRight
               wrapMode: Text.NoWrap
@@ -624,7 +633,7 @@ Panel {
 
               Label {
                 width: parent.width
-                text: strings.t("self.available").arg(String(root.selfUpdate.version || "")).arg(String(root.selfUpdate.currentVersion || ""))
+                text: root.fmt(strings.t("self.available"), root.selfUpdate.version || "", root.selfUpdate.currentVersion || "")
                 font.pixelSize: Style.font.bodySmall
               }
 
@@ -710,6 +719,7 @@ Panel {
               // BoundedTextField.qml.
               BoundedTextField {
                 id: urlField
+                live: root.opened
                 guardScript: root.guardScript
                 anchors.left: parent.left
                 anchors.right: scanButton.left
@@ -847,10 +857,18 @@ Panel {
             readonly property int infoCount: findings.filter(function(f) { return reportView.isMinor(f) }).length
             readonly property var hosts: {
               var nd = r.networkDestinations || {}
-              var purposes = {}
-              ;(nd.model || []).forEach(function(d) { purposes[d.host] = d.purpose })
-              var all = Object.keys(purposes)
-              ;(nd.static || []).forEach(function(d) { if (all.indexOf(d.host) < 0) all.push(d.host) })
+              var purposes = Object.create(null)
+              var seen = Object.create(null)
+              var all = []
+              ;(nd.model || []).forEach(function(d) {
+                if (!d || typeof d.host !== "string") return
+                purposes[d.host] = d.purpose
+                if (!seen[d.host]) { seen[d.host] = true; all.push(d.host) }
+              })
+              ;(nd.static || []).forEach(function(d) {
+                if (!d || typeof d.host !== "string") return
+                if (!seen[d.host]) { seen[d.host] = true; all.push(d.host) }
+              })
               all.sort()
               return all.map(function(h) { return purposes[h] ? h + " — " + purposes[h] : h })
             }
@@ -911,9 +929,10 @@ Panel {
               wrapMode: Text.Wrap
               text: reportView.r.marketplaceVerified ? strings.t("report.marketplaceVerified")
                 : reportView.r.ownPlugin ? strings.t("report.ownPlugin")
-                : (reportView.r.model ? strings.t("report.model").arg(reportView.r.model.label) + "  ·  " : "")
-                + strings.t("report.static").arg(strings.t("verdict." + (reportView.r.staticVerdict || "safe")))
-                  .arg(reportView.r.modelVerdict ? strings.t("verdict." + reportView.r.modelVerdict) : strings.t("report.notRun"))
+                : (reportView.r.model ? root.fmt(strings.t("report.model"), reportView.r.model.label) + "  ·  " : "")
+                + root.fmt(strings.t("report.static"),
+                  strings.t("verdict." + (reportView.r.staticVerdict || "safe")),
+                  reportView.r.modelVerdict ? strings.t("verdict." + reportView.r.modelVerdict) : strings.t("report.notRun"))
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
